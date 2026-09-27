@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { sanitizeFile, casesFile, saveCases, mergeCases, readCases, saveCaseResults, readCasesWithResults, deleteSpec } from "../src/lib/specs";
+import { sanitizeFile, casesFile, saveCases, mergeCases, readCases, saveCaseResults, readCasesWithResults, deleteSpec, deleteCases } from "../src/lib/specs";
 import { parseExplorationScope } from "../src/lib/exploration";
 import { saveFact } from "../src/lib/memory";
 import { assertPublicTarget } from "../src/lib/ssrf";
@@ -7,6 +7,11 @@ import { isReadOnlyCommand } from "../src/lib/browser";
 import { getBrowserTools } from "../src/lib/agent";
 import { rateLimit, tryEnter, leave } from "../src/lib/rate-limit";
 import { requireAuth } from "../src/lib/auth";
+// Static, not `await import()`: Playwright transpiles what the test file
+// imports statically, while a dynamic import of a .ts path falls through to
+// Node's own loader — which cannot parse TypeScript on the CI runner (Node 20).
+import { rowsToCases, suggestFileName } from "../src/lib/case-import";
+import { loadExcelJs, parseCsv, readSpreadsheet } from "../src/lib/spreadsheet";
 
 // Pure unit tests for agent lib helpers (no browser, no file writes:
 // every assertion below either validates input or expects a throw
@@ -60,7 +65,6 @@ test("incremental case merge replaces duplicate ids and preserves prior areas", 
     expect(cases.find((item) => item.id === "TC-002")?.area).toBe("Checkout");
   } finally {
     await deleteSpec(file).catch(() => null);
-    const { deleteCases } = await import("../src/lib/specs");
     await deleteCases(file);
   }
 });
@@ -141,7 +145,6 @@ test("manual results round-trip with validation", async () => {  const file = "t
     expect(merged[0].result.actual).toBe("dashboard shown");
   } finally {
     await deleteSpec(file).catch(() => null);
-    const { deleteCases } = await import("../src/lib/specs");
     await deleteCases(file);
   }
 });
@@ -163,7 +166,6 @@ test("auth is open without token, enforced with token", () => {
 });
 
 test("rowsToCases maps headers, splits steps, dedupes ids", async () => {
-  const { rowsToCases, suggestFileName } = await import("../src/lib/case-import");
   const headers = ["ID", "Area", "Type", "Title", "Test Data", "Test Step", "Expected Result", "Priority"];
   const out = rowsToCases(headers, [
     ["LGN001", "Login", "Positive", "valid login", "standard_user", "1. Input user 2. Input pass 3. Click login", "dashboard", "High"],
@@ -182,8 +184,7 @@ test("rowsToCases maps headers, splits steps, dedupes ids", async () => {
   await expect(async () => rowsToCases(["Foo", "Bar"], [["a", "b"]])).rejects.toThrow();
 });
 
-test("parseCsv handles quotes, embedded commas/newlines, CRLF and BOM", async () => {
-  const { parseCsv } = await import("../src/lib/spreadsheet");
+test("parseCsv handles quotes, embedded commas/newlines, CRLF and BOM", () => {
   expect(parseCsv('id,title\r\n1,"a, b"\r\n2,"line1\nline2"\r\n3,"say ""hi"""\r\n')).toEqual([
     ["id", "title"],
     ["1", "a, b"],
@@ -198,7 +199,6 @@ test("parseCsv handles quotes, embedded commas/newlines, CRLF and BOM", async ()
 });
 
 test("readSpreadsheet reads csv, xlsx and rejects legacy .xls", async () => {
-  const { readSpreadsheet } = await import("../src/lib/spreadsheet");
   const asFile = (bytes: Uint8Array, name: string) =>
     new File([bytes as unknown as BlobPart], name);
 
@@ -210,7 +210,6 @@ test("readSpreadsheet reads csv, xlsx and rejects legacy .xls", async () => {
   expect(csv[0].rows[0]).toEqual(["ID", "Title"]);
   expect(csv[0].rows[1]).toEqual(["TC-1", "login"]);
 
-  const { loadExcelJs } = await import("../src/lib/spreadsheet");
   const ExcelJS = await loadExcelJs();
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet("Login");
@@ -230,8 +229,6 @@ test("readSpreadsheet reads csv, xlsx and rejects legacy .xls", async () => {
 });
 
 test("readSpreadsheet import path produces cases end-to-end", async () => {
-  const { readSpreadsheet } = await import("../src/lib/spreadsheet");
-  const { rowsToCases } = await import("../src/lib/case-import");
   const csv = "ID,Area,Title,Steps,Expected Result\nLGN-1,Login,valid login,1. Open page 2. Click login,dashboard\n";
   const sheets = await readSpreadsheet(
     new File([new TextEncoder().encode(csv)] as unknown as BlobPart[], "cases.csv")
