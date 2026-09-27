@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 
-// Server-only: opt-in bearer auth for every /api/* route.
+// Server-only: opt-in bearer auth, enforced by guardApi.
 // - APP_TOKEN unset (default local use) → open, no friction.
-// - APP_TOKEN set → all API routes require `Authorization: Bearer <token>`.
-// Set APP_TOKEN whenever the server is reachable beyond localhost.
+// - APP_TOKEN set → routes that call guardApi require `Authorization: Bearer <token>`.
+//   /api/chat/stream and /api/docs/convert never call guardApi, so they skip
+//   this check too — keep the server on loopback (see package.json -H flag).
 export function requireAuth(req: Request): NextResponse | null {
   const token = process.env.APP_TOKEN?.trim();
   if (!token) return null;

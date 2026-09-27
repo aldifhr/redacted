@@ -1,10 +1,10 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 
 const BASE = 'https://practice.qabrains.com/ecommerce';
 const EMAIL = 'test@qabrains.com';
 const PASSWORD = 'Password123';
 
-async function login(page: any) {
+async function login(page: Page) {
   await page.goto(`${BASE}/login`);
   await page.fill('#email', EMAIL);
   await page.fill('#password', PASSWORD);
@@ -49,7 +49,9 @@ test.describe('Cart', () => {
     await addBtn.click();
     await page.goto(`${BASE}/cart`);
     await page.click('button:has-text("Remove")');
-    await expect(page.getByRole('heading', { name: 'Your Cart' })).toBeVisible();
+    // Remove asks for confirmation in a dialog before it acts.
+    await page.locator('[role="dialog"] button:has-text("Remove")').click();
+    await expect(page.getByRole('heading', { name: 'Your cart is empty' })).toBeVisible();
   });
 
   test('TC-018: should update quantity in cart using +/- buttons', async ({ page }) => {

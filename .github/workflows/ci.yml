@@ -18,5 +18,29 @@ jobs:
       - run: npx playwright install chromium --only-shell
       - run: npx tsc --noEmit
       - run: npm run lint
-      - run: npx playwright test tests/lib.spec.ts --reporter=line
+      # Deterministic, no network: unit tests for lib helpers.
+      - run: npm run test:unit -- --reporter=line
+      # Fail the build on known-vulnerable dependency ranges.
+      - run: npm audit --audit-level=high
       - run: npm run build
+
+  # Full suite hits live third-party demo sites (saucedemo, qabrains, example.com),
+  # so it runs as its own job: a red here is a real regression or an upstream
+  # outage, and it never masks the deterministic gate above.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install chromium --with-deps
+      - run: npm test -- --reporter=line
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-artifacts
+          path: test-results/
+          retention-days: 7

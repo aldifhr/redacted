@@ -40,10 +40,12 @@ test.describe('Product Details', () => {
   test('TC-012: should add product to cart from detail page with quantity', async ({ page }) => {
     await page.goto(`${BASE}/product-details?id=1`);
     await page.click('button:has-text("+")'); // qty = 2
+    await expect(page.locator('input.w-10')).toHaveValue('2');
     await page.click('button:has-text("Add to cart")');
-    await expect(page.locator('span:has-text("2")').first()).toBeVisible();
-    await page.click('button:has-text("Back to Products")');
-    await page.waitForURL(/\/ecommerce\/?$/);
+    // The header badge counts line items, not quantity — assert the cart itself.
+    await page.goto(`${BASE}/cart`);
+    await expect(page.getByText('Quantity').locator('..')).toContainText('2');
+    await expect(page.getByText('Total').locator('..')).toContainText('$99.98');
   });
 
   test('TC-013: should navigate back to products from detail page', async ({ page }) => {

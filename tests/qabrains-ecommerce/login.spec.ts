@@ -22,7 +22,7 @@ test.describe('Login', () => {
     await page.fill('#password', PASSWORD);
     await page.click('button.btn-submit.uppercase');
     await expect(page).toHaveURL(/\/ecommerce\/login/);
-    await expect(page.locator('[data-test="error"], .error-message, .alert')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText('Username is incorrect.', { exact: true })).toBeVisible({ timeout: 5000 });
   });
 
   test('TC-003: should show error for invalid password', async ({ page }) => {
@@ -30,7 +30,7 @@ test.describe('Login', () => {
     await page.fill('#password', 'wrongpass');
     await page.click('button.btn-submit.uppercase');
     await expect(page).toHaveURL(/\/ecommerce\/login/);
-    await expect(page.locator('[data-test="error"], .error-message, .alert')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText('Password is incorrect.', { exact: true })).toBeVisible({ timeout: 5000 });
   });
 
   test('TC-004: should show error for empty fields', async ({ page }) => {

@@ -108,16 +108,30 @@ export function messageToHtml(content: string): string {
 }
 
 export async function downloadXlsx(baseName: string, tables: ParsedTable[]) {
-  const XLSX = await import("xlsx");
-  const wb = XLSX.utils.book_new();
+  const { loadExcelJs } = await import("@/lib/spreadsheet");
+  const ExcelJS = await loadExcelJs();
+  const wb = new ExcelJS.Workbook();
   tables.forEach((t, i) => {
-    const ws = XLSX.utils.aoa_to_sheet([t.headers, ...t.rows]);
-    ws["!cols"] = t.headers.map((h, ci) => ({
-      wch: Math.min(60, Math.max(h.length, ...t.rows.map((r) => (r[ci] ?? "").length)) + 2),
-    }));
-    XLSX.utils.book_append_sheet(wb, ws, `Table ${i + 1}`);
+    const ws = wb.addWorksheet(`Table ${i + 1}`);
+    ws.addRow(t.headers);
+    t.rows.forEach((r) => ws.addRow(r));
+    t.headers.forEach((h, ci) => {
+      const width = Math.min(60, Math.max(h.length, ...t.rows.map((r) => (r[ci] ?? "").length)) + 2);
+      ws.getColumn(ci + 1).width = width;
+    });
   });
-  XLSX.writeFile(wb, `${baseName}.xlsx`);
+  const buffer = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buffer], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `${baseName}.xlsx`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 export function downloadMarkdown(baseName: string, content: string) {

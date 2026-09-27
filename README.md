@@ -33,6 +33,8 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+`dev` and `start` pass `-H 127.0.0.1`, so the server listens on loopback only and is never reachable from the LAN. Next's default is `0.0.0.0`, which would expose every `/api/*` route to the network. Dropping the flag is not safe today even with `APP_TOKEN` set: `/api/chat/stream` and `/api/docs/convert` skip `guardApi`, so they never reach the token check.
+
 Configure the provider, API key, base URL, and model at `/settings`. Settings are stored in the browser's local storage. Browser-only Playwright checks do not require an LLM API key.
 
 ### Remote browser (optional)
@@ -81,11 +83,11 @@ FarayAgent is designed for a **single-user trusted local environment**, not publ
 
 - Browser navigation blocks loopback/private/link-local/cloud-metadata targets (pre- and post-redirect); custom LLM `baseUrl` values are validated the same way (loopback allowed for local gateways like Ollama).
 - `browser_bash` runs without a shell (allowlisted commands only, no pipes/redirects) and pauses for explicit user approval; without an approval channel it is denied except for read-only commands (`ls`, `cat`, `grep`, …).
-- Uploads (Excel/PDF/Word) are parsed **client-side only** — the server never touches binary uploads.
+- Uploads (Excel/PDF/Word) are parsed **client-side only** — the server never touches binary uploads. Spreadsheet import (XLSX/CSV) uses `exceljs` plus a built-in CSV parser; legacy binary `.xls` is rejected with a prompt to re-save as `.xlsx`/`.csv`.
 - Secrets are rejected from memory and redacted from tool logs; chat request bodies are Zod-validated with size caps.
 - Each agent run gets an isolated `BrowserContext` (closed on run end); manual `/api/browser` use shares one page.
-- Rate limits guard expensive endpoints (max 3 concurrent chat runs); set `APP_TOKEN` to require bearer auth on all `/api/*` routes (open by default for local use).
-- `npm run build`, `tsc`, `lint`, and Playwright tests run in CI (`.github/workflows/ci.yml`).
+- `guardApi` applies a per-IP sliding-window rate limit to most `/api/*` routes. **`/api/chat/stream` and `/api/docs/convert` are exempt** — they skip `guardApi` entirely, which means they also never reach the `APP_TOKEN` check (`requireAuth` lives inside `guardApi`). Set `APP_TOKEN` to require bearer auth on the routes that do use `guardApi` (open by default for local use); the two exempt routes are unprotected either way, which is why the server binds loopback only.
+- CI runs `tsc`, `lint`, unit tests (`tests/lib.spec.ts`), `npm audit`, and `npm run build` as the deterministic gate, plus a separate job for the full Playwright suite against live demo sites (`.github/workflows/ci.yml`).
 
 ## Skills
 
@@ -155,8 +157,10 @@ tests/                          Playwright specs and artifacts, grouped per site
 ## Verification
 
 ```bash
-npx tsc --noEmit
+npm run typecheck
 npm run lint
+npm run test:unit   # tests/lib.spec.ts — no network, no browser
+npm test            # full Playwright suite — hits live demo sites
 npm run build
 ```
 

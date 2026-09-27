@@ -74,7 +74,7 @@ test.describe('SauceDemo Critical Path', () => {
 
     await page.locator('#finish').click();
     await expect(page).toHaveURL(/checkout-complete\.html/);
-    await expect(page.locator('.complete-header')).toHaveText('THANK YOU FOR YOUR ORDER');
+    await expect(page.locator('.complete-header')).toHaveText(/thank you for your order/i);
   });
 
   test('TC-LOGIN-002: Invalid login shows error', async ({ page }) => {

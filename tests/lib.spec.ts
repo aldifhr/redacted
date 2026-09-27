@@ -99,8 +99,14 @@ test("bash without approval channel denies executors, allows readers", async () 
   const tools = getBrowserTools();
   const bash = tools.browser_bash as unknown as { execute: (input: unknown) => Promise<unknown> };
   await expect(bash.execute({ command: "npx something-evil" })).rejects.toThrow(/denied/i);
-  const out = (await bash.execute({ command: "echo hi" })) as { stdout: string };
-  expect(out.stdout.trim()).toBe("hi");
+  // Allowlisted but not read-only: still denied when no human is in the loop.
+  await expect(bash.execute({ command: "node -e 'console.log(1)'" })).rejects.toThrow(/denied/i);
+  // `echo` is a cmd.exe builtin with no spawnable exe on Windows, so the
+  // read-only happy path can only be exercised where a real binary exists.
+  if (process.platform !== "win32") {
+    const out = (await bash.execute({ command: "echo hi" })) as { stdout: string };
+    expect(out.stdout.trim()).toBe("hi");
+  }
 });
 
 test("rate limiter allows then rejects over the limit", () => {
@@ -174,4 +180,65 @@ test("rowsToCases maps headers, splits steps, dedupes ids", async () => {
   expect(fb[0].area).toBe("Cart");
   expect(suggestFileName("TestCase_SauceDemo.xlsx")).toBe("TestCase_SauceDemo.spec.ts");
   await expect(async () => rowsToCases(["Foo", "Bar"], [["a", "b"]])).rejects.toThrow();
+});
+
+test("parseCsv handles quotes, embedded commas/newlines, CRLF and BOM", async () => {
+  const { parseCsv } = await import("../src/lib/spreadsheet");
+  expect(parseCsv('id,title\r\n1,"a, b"\r\n2,"line1\nline2"\r\n3,"say ""hi"""\r\n')).toEqual([
+    ["id", "title"],
+    ["1", "a, b"],
+    ["2", "line1\nline2"],
+    ["3", 'say "hi"'],
+  ]);
+  expect(parseCsv("\uFEFFid,title\n1,x")).toEqual([
+    ["id", "title"],
+    ["1", "x"],
+  ]);
+  expect(parseCsv("")).toEqual([]);
+});
+
+test("readSpreadsheet reads csv, xlsx and rejects legacy .xls", async () => {
+  const { readSpreadsheet } = await import("../src/lib/spreadsheet");
+  const asFile = (bytes: Uint8Array, name: string) =>
+    new File([bytes as unknown as BlobPart], name);
+
+  const csv = await readSpreadsheet(
+    asFile(new TextEncoder().encode("ID,Title\nTC-1,login\n"), "cases.csv")
+  );
+  expect(csv).toHaveLength(1);
+  expect(csv[0].name).toBe("CSV");
+  expect(csv[0].rows[0]).toEqual(["ID", "Title"]);
+  expect(csv[0].rows[1]).toEqual(["TC-1", "login"]);
+
+  const { loadExcelJs } = await import("../src/lib/spreadsheet");
+  const ExcelJS = await loadExcelJs();
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet("Login");
+  ws.addRow(["ID", "Title", "Steps"]);
+  ws.addRow(["TC-001", "valid login", "1. Open page\n2. Click login"]);
+  ws.addRow([42, true, null]);
+  const xlsx = await readSpreadsheet(asFile(new Uint8Array(await wb.xlsx.writeBuffer()), "cases.xlsx"));
+  expect(xlsx).toHaveLength(1);
+  expect(xlsx[0].name).toBe("Login");
+  expect(xlsx[0].rows[0]).toEqual(["ID", "Title", "Steps"]);
+  expect(xlsx[0].rows[1]).toEqual(["TC-001", "valid login", "1. Open page\n2. Click login"]);
+  expect(xlsx[0].rows[2]).toEqual(["42", "true", ""]);
+
+  // OLE2 magic — the format xlsx@0.18.5 accepted and exceljs deliberately does not.
+  const ole2 = new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0]);
+  await expect(readSpreadsheet(asFile(ole2, "legacy.xls"))).rejects.toThrow(/legacy \.xls/);
+});
+
+test("readSpreadsheet import path produces cases end-to-end", async () => {
+  const { readSpreadsheet } = await import("../src/lib/spreadsheet");
+  const { rowsToCases } = await import("../src/lib/case-import");
+  const csv = "ID,Area,Title,Steps,Expected Result\nLGN-1,Login,valid login,1. Open page 2. Click login,dashboard\n";
+  const sheets = await readSpreadsheet(
+    new File([new TextEncoder().encode(csv)] as unknown as BlobPart[], "cases.csv")
+  );
+  const [head, ...rows] = sheets[0].rows;
+  const cases = rowsToCases(head, rows, { areaFallback: "Sheet", idPrefix: "SH" });
+  expect(cases).toHaveLength(1);
+  expect(cases[0].id).toBe("LGN-1");
+  expect(cases[0].steps).toEqual(["Open page", "Click login"]);
 });

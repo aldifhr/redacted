@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, CheckCircle2, Copy, FileText, FileUp, FlaskConical, Play, RotateCw, Trash2, XCircle } from "lucide-react";
 import { rowsToCases, suggestFileName, type ImportedCase } from "@/lib/case-import";
+import { readSpreadsheet } from "@/lib/spreadsheet";
 import Stagger from "@/components/chat/Stagger";
 
 type SpecInfo = { file: string; kb: number; updatedAt: number };
@@ -86,22 +87,16 @@ export default function TestsPage() {
     if (!file) return;
     setError("");
     try {
-      const XLSX = await import("xlsx");
-      const buffer = await file.arrayBuffer();
-      const wb = XLSX.read(buffer, { type: "array", sheetRows: 200 });
-      if (!wb.SheetNames.length) throw new Error("Workbook has no sheets");
+      const sheets = await readSpreadsheet(file);
       const merged: ImportedCase[] = [];
-      for (const sheetName of wb.SheetNames.slice(0, 10)) {
-        const rows = XLSX.utils.sheet_to_json<(string | number | boolean | null | undefined)[]>(
-          wb.Sheets[sheetName],
-          { header: 1, raw: false, defval: "" }
-        );
-        if (rows.length < 2) continue;
-        const headers = (rows[0] as unknown[]).map((h) => String(h ?? ""));
+      for (const sheet of sheets) {
+        const [headerRow, ...rows] = sheet.rows;
+        if (!headerRow || !rows.length) continue;
+        const headers = headerRow;
         try {
-          const parsed = rowsToCases(headers, rows.slice(1) as (string | number | boolean | null | undefined)[][], {
-            areaFallback: sheetName,
-            idPrefix: sheetName.slice(0, 4).toUpperCase() || "TC",
+          const parsed = rowsToCases(headers, rows, {
+            areaFallback: sheet.name,
+            idPrefix: sheet.name.slice(0, 4).toUpperCase() || "TC",
           });
           merged.push(...parsed);
         } catch {
