@@ -95,3 +95,46 @@ Usage is accumulated as a single cumulative blob (`route.ts:434-449`): no round 
 9. **Regression tests** per task doc §14; run `npm run test:unit` + `typecheck` + `lint` and report real output.
 
 No new dependencies required for phases 2–9 (hashing: `node:crypto`; storage: existing `fs` patterns; tokenizer: provider usage metadata with labeled estimates).
+
+---
+
+# Implementation status (all phases delivered)
+
+Commits: `09c1e8a` (phase 2) → `2f7ea00` (3) → `1f3cf05` (4) → `d5a528e` (5–9).
+
+## Modified / added files
+
+**New modules**
+- `src/lib/token-meter.ts` — per-request token accounting, per-phase aggregates, estimate labeling (phase 2)
+- `src/lib/evidence-store.ts` — append-only full-fidelity evidence store with `ev_N` IDs (phase 3, layer E)
+- `src/lib/context.ts` — the six context layers as typed builders + prompt/round composition (phase 3)
+- `src/lib/observation-dedup.ts` — content-addressed observation dedup (phase 4B)
+- `src/lib/observation-compact.ts` — tool-result compaction + `rewriteToolOutputs` (phase 4C/4D)
+- `src/lib/task-state.ts` — task board + selection (phase 6)
+- `src/lib/coverage.ts` — backend-authoritative area statuses (phase 8)
+- `src/lib/context-compactor.ts` — deterministic history compaction (phase 5)
+- `src/lib/budget.ts` — configurable budgets + per-phase ceilings (phase 7)
+
+**Modified**
+- `src/app/api/chat/stream/route.ts` — wires all of the above: evidence append + dedup + compaction per tool result, task board in the prompt, per-round status refresh, budget verdicts, graceful-exhaustion checkpoint, `tokenStats`/`tasks`/`budget` in the `done` payload
+- `src/lib/agent.ts` — new `evidence_read` tool (full payload by ID, budget-exempt)
+- `src/lib/report.ts` — `evidenceId` on ledger entries, `areaStatuses`/`overall` on Coverage, `Partially verified` status, backend-first `resolveStatus`, overall-status header
+- `src/components/chat/types.ts`, `src/components/Chat.tsx` — `TokenStats` type, token meter tooltip shows per-phase breakdown + estimated/cached
+- `tests/lib.spec.ts` — 33 new regression tests (phases 2–9)
+
+## Measured results
+
+- Unit suite: **61 passed**, 1 failed — `ssrf guard unwraps hex IPv4-mapped IPv6`, **pre-existing on `acb828f`** (verified via `git stash`), untouched by this work.
+- `tsc --noEmit` clean; `eslint` clean (1 pre-existing warning in `scripts/debug-all-tools.ts`).
+- Token model (derived from code constants, same method as the audit): per-round history growth drops from ~3–5k tokens to ~100–200; 33-round history from ~70k to ~5k tokens; projected run total ~450k gross / ~150–250k with prompt caching vs the observed 1.03M.
+
+## Remaining limitations (honest list)
+
+1. **No live before/after run yet** — projections are derived from code constants; the SauceDemo re-run with the new pipeline has not been executed on this machine (no provider key configured here). The meter now records per-round/per-phase usage so the next real run produces the measurement.
+2. **VERIFIED requires a passing `test_assert`** — areas the model only browses cap at PARTIALLY_VERIFIED by design. This is the conservative fix for the false-Verified bug; runs whose models rarely assert will report more partials (correct, not a regression).
+3. **Sub-agent (`browser_delegate`) history is internal to one `generateText` call** — dedup/compaction do not apply inside it; bounded by its 8-step cap.
+4. **Prompt caching is provider-side** — the system prompt (~12.6k tokens/round) is still resent every round; `cachedInputTokens` is now tracked so cache hit rates are visible, but no explicit cache-control annotations are sent.
+5. **The scribe fallback double-call remains** for gateways without json_schema support (now inside the reserved reporting budget).
+6. **`evidence_read` returns full payloads including base64 screenshots** when explicitly requested — intentional (explicit retrieval), but it re-enters context at full size.
+7. **SKIPPED status is defined but never set** — no scope-exclusion syntax exists in `parseExplorationScope` yet.
+8. **Checkpoint resume is scope-level** (completed areas), not task-ID-level; a resumed run rebuilds the task board and re-derives statuses from the new run's ledger rather than importing the old one.
