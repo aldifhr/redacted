@@ -25,6 +25,15 @@ import { rowsToCases, suggestFileName } from "../src/lib/case-import";
 import { loadExcelJs, parseCsv, readSpreadsheet } from "../src/lib/spreadsheet";
 import { areaForUrl, looksLikeErrorPage, urlMatchesArea } from "../src/lib/report";
 import { estimateCost, fmtTokens } from "../src/lib/cost";
+import {
+  clearRunTokens,
+  estimateTokens,
+  getRunTokenStats,
+  recordBrowserAction,
+  recordToolResult,
+  recordTokenUsage,
+  usageSnapshot,
+} from "../src/lib/token-meter";
 import { readRunLog, startRunLog, logRunEvent, finishRunLog } from "../src/lib/run-log";
 import { withSpan } from "../src/lib/telemetry";
 import { promises as fs } from "node:fs";
@@ -371,6 +380,127 @@ test("resolveKey prefers the presented key, falls back to the vault, then throws
     // key yang dikirim tetap menang atas vault
     expect(resolveKey("openai", "sk-presented-123456")).toBe("sk-presented-123456");
   });
+});
+
+// ── token-meter: centralized LLM usage accounting ──
+
+test("token meter records provider usage exactly and never flags it estimated", () => {
+  const runId = "meter-exact";
+  clearRunTokens(runId);
+  recordTokenUsage({
+    runId,
+    phase: "EXPLORATION",
+    round: 0,
+    agent: "main",
+    model: "gpt-4o",
+    provider: "openai",
+    usage: { inputTokens: 1200, outputTokens: 300, cachedInputTokens: 1000 },
+    durationMs: 500,
+  });
+  const stats = getRunTokenStats(runId)!;
+  expect(stats.inputTokens).toBe(1200);
+  expect(stats.outputTokens).toBe(300);
+  expect(stats.totalTokens).toBe(1500);
+  expect(stats.cachedInputTokens).toBe(1000);
+  expect(stats.estimatedTokens).toBe(0);
+  expect(stats.requests).toBe(1);
+  expect(stats.rounds).toBe(1);
+  expect(stats.byPhase.EXPLORATION.totalTokens).toBe(1500);
+  expect(stats.largestRequest).toEqual({ totalTokens: 1500, phase: "EXPLORATION", round: 0 });
+});
+
+test("token meter labels char estimates as estimated, including partial usage", () => {
+  const runId = "meter-estimated";
+  clearRunTokens(runId);
+  // no provider usage at all → both sides estimated from chars
+  recordTokenUsage({
+    runId,
+    phase: "REPORTING",
+    round: 3,
+    agent: "main",
+    model: "m",
+    provider: "p",
+    requestChars: 40000,
+    responseChars: 800,
+    durationMs: 100,
+  });
+  // partial usage: input exact, output missing → still flagged estimated
+  recordTokenUsage({
+    runId,
+    phase: "REPORTING",
+    round: 4,
+    agent: "main",
+    model: "m",
+    provider: "p",
+    usage: { inputTokens: 100 },
+    responseChars: 800,
+    durationMs: 100,
+  });
+  const stats = getRunTokenStats(runId)!;
+  expect(stats.inputTokens).toBe(10100); // 10000 estimated + 100 exact
+  expect(stats.outputTokens).toBe(400); // 200 + 200, both estimated
+  expect(stats.estimatedTokens).toBe(10400); // everything except the exact 100
+  expect(stats.totalTokens).toBe(10500);
+  expect(stats.byPhase.REPORTING.requests).toBe(2);
+});
+
+test("token meter accumulates across requests without double counting", () => {
+  const runId = "meter-accumulate";
+  clearRunTokens(runId);
+  for (let i = 0; i < 5; i += 1) {
+    recordTokenUsage({
+      runId,
+      phase: "EXPLORATION",
+      round: i,
+      agent: "main",
+      model: "m",
+      provider: "p",
+      usage: { inputTokens: 100, outputTokens: 10 },
+      durationMs: 1,
+    });
+  }
+  recordTokenUsage({
+    runId,
+    phase: "EXPLORATION",
+    round: 0,
+    agent: "sub",
+    model: "m",
+    provider: "p",
+    usage: { inputTokens: 50, outputTokens: 5 },
+    durationMs: 1,
+  });
+  const stats = getRunTokenStats(runId)!;
+  expect(stats.requests).toBe(6);
+  expect(stats.totalTokens).toBe(5 * 110 + 55);
+  expect(stats.rounds).toBe(5); // sub-agent requests are not main model rounds
+  expect(stats.byPhase.EXPLORATION.requests).toBe(6);
+  expect(stats.largestRequest?.totalTokens).toBe(110);
+});
+
+test("token meter tracks the largest tool result and browser actions", () => {
+  const runId = "meter-toolresult";
+  clearRunTokens(runId);
+  recordToolResult(runId, "browser_snapshot", { elements: "x".repeat(12000) });
+  recordToolResult(runId, "browser_click", { ok: true });
+  recordBrowserAction(runId);
+  recordBrowserAction(runId);
+  const stats = getRunTokenStats(runId)!;
+  expect(stats.largestToolResult?.tool).toBe("browser_snapshot");
+  expect(stats.largestToolResult?.chars).toBeGreaterThan(12000);
+  expect(stats.browserActions).toBe(2);
+});
+
+test("token meter snapshot stays UI-compatible and unknown runs read as zero", () => {
+  expect(usageSnapshot(null)).toEqual({ inputTokens: 0, outputTokens: 0, totalTokens: 0 });
+  expect(usageSnapshot(getRunTokenStats("meter-missing"))).toEqual({
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+  });
+  expect(estimateTokens(40000)).toBe(10000);
+  expect(estimateTokens(0)).toBe(0);
+  expect(estimateTokens(-5)).toBe(0);
+  clearRunTokens("meter-missing");
 });
 
 test("withSpan passes results through and rethrows without swallowing", async () => {

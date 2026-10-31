@@ -44,7 +44,7 @@ import { useToast } from "@/components/ui/toast";
 import { useAppStore } from "@/lib/app-store";
 import { abortRun, hasRun, trackRun, untrackRun } from "@/lib/chat-runs";
 import { estimateCost, fmtTokens } from "@/lib/cost";
-import { now, type Approval, type Attachment, type LightboxState, type Msg, type ThinkingEntry } from "@/components/chat/types";
+import { now, type Approval, type Attachment, type LightboxState, type Msg, type ThinkingEntry, type TokenStats } from "@/components/chat/types";
 import { PROGRESS_LABELS, PROVIDER_META, SUGGESTIONS, TOOL_META } from "@/components/chat/meta";
 import { COMMANDS, HELP_TEXT, parseCommand } from "@/components/chat/commands";
 import { downloadXlsx, downloadMarkdown, messageToHtml, parseMarkdownTables, printMessage } from "@/components/chat/export";
@@ -91,6 +91,7 @@ type DoneData = {
   stopReason?: Msg["stopReason"];
   skills?: string[];
   usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  tokenStats?: TokenStats;
   model?: string;
 };
 type Replay = {
@@ -299,6 +300,7 @@ export default function Chat({ sessionId: lockedSessionId }: { sessionId?: strin
               stopReason: d.stopReason,
               skills: d.skills,
               usage: d.usage,
+              tokenStats: d.tokenStats,
               model: d.model ?? model,
               time: now(),
             },
@@ -850,6 +852,7 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
               stopReason?: Msg["stopReason"];
               skills?: string[];
               usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+              tokenStats?: TokenStats;
             };
             finalData = completed;
             if (completed.toolCalls?.length || completed.artifacts?.length) {
@@ -1016,9 +1019,27 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
         acc.inputTokens += m.usage.inputTokens ?? 0;
         acc.outputTokens += m.usage.outputTokens ?? 0;
       }
+      if (m.tokenStats) {
+        acc.estimatedTokens += m.tokenStats.estimatedTokens;
+        acc.cachedInputTokens += m.tokenStats.cachedInputTokens;
+        for (const [phase, v] of Object.entries(m.tokenStats.byPhase)) {
+          const slot = acc.byPhase[phase] ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0, requests: 0 };
+          slot.inputTokens += v.inputTokens;
+          slot.outputTokens += v.outputTokens;
+          slot.totalTokens += v.totalTokens;
+          slot.requests += v.requests;
+          acc.byPhase[phase] = slot;
+        }
+      }
       return acc;
     },
-    { inputTokens: 0, outputTokens: 0 }
+    {
+      inputTokens: 0,
+      outputTokens: 0,
+      estimatedTokens: 0,
+      cachedInputTokens: 0,
+      byPhase: {} as Record<string, { inputTokens: number; outputTokens: number; totalTokens: number; requests: number }>,
+    }
   );
   if (loading && liveUsage) {
     usageTotals.inputTokens += liveUsage.inputTokens;
@@ -1026,6 +1047,13 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
   }
   const totalTokens = usageTotals.inputTokens + usageTotals.outputTokens;
   const runCost = estimateCost(model, usageTotals.inputTokens, usageTotals.outputTokens);
+  // Phase breakdown for the token meter tooltip (empty until a run with
+  // tokenStats lands in this session).
+  const phaseLines = Object.entries(usageTotals.byPhase)
+    .filter(([, v]) => v.totalTokens > 0)
+    .map(([phase, v]) => `\n${phase}: ${v.totalTokens.toLocaleString()} tok · ${v.requests} req`)
+    .join("");
+  const meterExtra = `${phaseLines}${usageTotals.estimatedTokens > 0 ? `\n~${usageTotals.estimatedTokens.toLocaleString()} tok estimated (provider exposed no usage)` : ""}${usageTotals.cachedInputTokens > 0 ? `\n${usageTotals.cachedInputTokens.toLocaleString()} cached input tok` : ""}`;
   const activeRunId = activeId ? runningIds[activeId] : undefined;
   const reconnecting =
     !!activeRunId && !hasRun(activeId ?? "") && !loading && !resumedRef.current.has(activeRunId);
@@ -1106,7 +1134,7 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
             )}
             {totalTokens > 0 && (
               <span
-                title={`${usageTotals.inputTokens.toLocaleString()} input + ${usageTotals.outputTokens.toLocaleString()} output tokens${runCost !== null ? ` · est. $${runCost.toFixed(4)}` : ""}`}
+                title={`${usageTotals.inputTokens.toLocaleString()} input + ${usageTotals.outputTokens.toLocaleString()} output tokens${runCost !== null ? ` · est. $${runCost.toFixed(4)}` : ""}${meterExtra}`}
                 className="hidden items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-[10px] text-zinc-400 sm:flex"
               >
                 <Zap size={11} />

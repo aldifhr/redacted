@@ -22,6 +22,16 @@ import { loadInstalledSkillsSync } from "@/lib/skills";
 import { assertPublicTarget } from "@/lib/ssrf";
 import { flushLogs } from "@/lib/tool-logs";
 import { finishRunLog, logRunEvent, startRunLog } from "@/lib/run-log";
+import {
+  clearRunTokens,
+  getRunTokenStats,
+  recordBrowserAction,
+  recordToolResult,
+  recordTokenUsage,
+  usageSnapshot,
+  type TokenPhase,
+  type TokenUsageInput,
+} from "@/lib/token-meter";
 import { parseExplorationScope, readExplorationCheckpoint, readLatestCheckpoint, saveExplorationCheckpoint } from "@/lib/exploration";
 import {
   ReportDataSchema,
@@ -258,6 +268,7 @@ async function handleStream(
             undefined,
             runId
           );
+          const subStarted = Date.now();
           const subResult = await generateText({
             model: llm,
             system:
@@ -269,6 +280,18 @@ async function handleStream(
             tools: subTools,
             stopWhen: stepCountIs(8),
             abortSignal: req.signal,
+          });
+          recordTokenUsage({
+            runId,
+            phase: "EXPLORATION",
+            round: 0,
+            agent: "sub",
+            model: chosenModel,
+            provider,
+            usage: subResult.usage as TokenUsageInput | undefined,
+            requestChars: task.length + 600,
+            responseChars: (subResult.text ?? "").length,
+            durationMs: Date.now() - subStarted,
           });
           return {
             role: "qa_subagent",
@@ -293,6 +316,7 @@ async function handleStream(
           (toolName, input) => {
              if (isBrowserAction(toolName)) {
                browserActionsExecuted += 1;
+               recordBrowserAction(runId);
              }
              toolCalls.push({ tool: toolName, input });
              lastLabel = statusLabel(toolName, input);
@@ -362,12 +386,13 @@ async function handleStream(
             send("aborted", {});
             return;
           }
-          if (tokenBudget > 0 && tokensUsed >= tokenBudget) {
+          const runTokens = getRunTokenStats(runId);
+          if (tokenBudget > 0 && (runTokens?.totalTokens ?? 0) >= tokenBudget) {
             stopReason = "budget_limit";
             capped = true;
             send("status", {
               label: "Token budget reached",
-              thinking: `Run stopped after ${tokensUsed.toLocaleString()} tokens (limit ${tokenBudget.toLocaleString()}).`,
+              thinking: `Run stopped after ${(runTokens?.totalTokens ?? 0).toLocaleString()} tokens (limit ${tokenBudget.toLocaleString()}).`,
               phase: "Reporting",
               agent: "main",
             });
@@ -387,6 +412,7 @@ async function handleStream(
           }
            // Client aborts (Stop button, tab close) must cancel the model call
            // immediately — not after the 120s step timeout.
+           const stepStarted = Date.now();
            const stepSignal = AbortSignal.any([req.signal, AbortSignal.timeout(STEP_TIMEOUT_MS)]);
            const outcome = await generateText({
              model: llm,
@@ -431,22 +457,37 @@ async function handleStream(
            consecutiveTimeouts = 0;
           modelRounds += 1;
           const step = result.steps[0];
-          if (result.usage) {
-            const prev = (usage ?? {}) as {
-              inputTokens?: number;
-              outputTokens?: number;
-              totalTokens?: number;
-            };
-            const inputTokens = (prev.inputTokens ?? 0) + (result.usage.inputTokens ?? 0);
-            const outputTokens = (prev.outputTokens ?? 0) + (result.usage.outputTokens ?? 0);
-            usage = {
-              inputTokens,
-              outputTokens,
-              totalTokens: inputTokens + outputTokens,
-            };
-            tokensUsed = inputTokens + outputTokens;
-            send("usage", usage);
-          }
+          // Centralized token accounting: exactly one record per provider
+          // request. Phase is VERIFICATION when this round ran deterministic
+          // assertions, otherwise EXPLORATION.
+          const roundPhase: TokenPhase = (step?.toolCalls ?? []).some(
+            (t) => t.toolName === "test_assert"
+          )
+            ? "VERIFICATION"
+            : "EXPLORATION";
+          const tokenRecord = recordTokenUsage({
+            runId,
+            phase: roundPhase,
+            round: i,
+            agent: "main",
+            model: chosenModel,
+            provider,
+            usage: result.usage as TokenUsageInput | undefined,
+            requestChars: Number.isFinite(result.usage?.inputTokens)
+              ? undefined
+              : executionPrompt.length + JSON.stringify(modelMessages).length,
+            responseChars: (result.text ?? "").length,
+            durationMs: Date.now() - stepStarted,
+          });
+          const runStats = getRunTokenStats(runId);
+          tokensUsed = runStats?.totalTokens ?? 0;
+          const usageSnap = usageSnapshot(runStats);
+          usage = usageSnap;
+          send("usage", {
+            ...usageSnap,
+            rounds: runStats?.rounds ?? 0,
+            estimated: tokenRecord.estimated,
+          });
           if (result.text) fullText += (fullText ? "\n" : "") + result.text;
           // Raw model reasoning: stream the step's actual text instead of
           // only the canned per-tool summary, so "Agent thinking" is verbatim.
@@ -473,6 +514,7 @@ async function handleStream(
           }
            for (let ti = 0; ti < (step?.toolResults ?? []).length; ti += 1) {
              const tr = (step?.toolResults ?? [])[ti];
+             recordToolResult(runId, tr.toolName, tr.output);
              // Fix 1: failed or denied tool calls are NOT evidence. A click on
              // a nonexistent selector must not land its selector in the report.
              const trRec = tr as unknown as Record<string, unknown>;
@@ -759,6 +801,7 @@ async function handleStream(
           };
           let object: z.infer<typeof ReportDataSchema> | null = null;
           let structuredError: unknown = null;
+          const scribeStarted = Date.now();
           try {
             const res = await generateObject({
               model: llm,
@@ -768,6 +811,20 @@ async function handleStream(
               abortSignal: AbortSignal.any([req.signal, AbortSignal.timeout(180_000)]),
             });
             object = res.object;
+            recordTokenUsage({
+              runId,
+              phase: "REPORTING",
+              round: modelRounds,
+              agent: "main",
+              model: chosenModel,
+              provider,
+              usage: res.usage as TokenUsageInput | undefined,
+              requestChars: Number.isFinite(res.usage?.inputTokens)
+                ? undefined
+                : scribeRules.length + scribeRequest.length,
+              responseChars: JSON.stringify(object).length,
+              durationMs: Date.now() - scribeStarted,
+            });
           } catch (e) {
             structuredError = e;
             try {
@@ -776,6 +833,20 @@ async function handleStream(
                 system: `${scribeRules} ${JSON_SHAPE}`,
                 messages: [{ role: "user", content: scribeRequest }],
                 abortSignal: AbortSignal.any([req.signal, AbortSignal.timeout(120_000)]),
+              });
+              recordTokenUsage({
+                runId,
+                phase: "REPORTING",
+                round: modelRounds,
+                agent: "main",
+                model: chosenModel,
+                provider,
+                usage: res2.usage as TokenUsageInput | undefined,
+                requestChars: Number.isFinite(res2.usage?.inputTokens)
+                  ? undefined
+                  : scribeRules.length + JSON_SHAPE.length + scribeRequest.length,
+                responseChars: (res2.text ?? "").length,
+                durationMs: Date.now() - scribeStarted,
               });
               const parsed = ReportDataSchema.safeParse(extractJson(res2.text));
               if (parsed.success) object = parsed.data;
@@ -828,6 +899,7 @@ async function handleStream(
           model: chosenModel,
           provider,
           capped,
+          tokenStats: getRunTokenStats(runId),
           // Fix D: persist the evidence ledger + test outcomes in done.data so
           // any report can be re-audited post-hoc (excerpts trimmed for size).
           ledger: ledger.map((e) => ({
@@ -861,6 +933,7 @@ async function handleStream(
         clearInterval(heartbeat);
         rejectRunApprovals(runId);
         endRun(runId);
+        clearRunTokens(runId);
         await browser.closeSession(runId).catch(() => null);
         await flushLogs().catch(() => null);
         await finishRunLog(runId, terminal).catch(() => null);

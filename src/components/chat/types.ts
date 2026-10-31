@@ -1,5 +1,23 @@
 export type ThinkingEntry = string | { text: string; phase?: string };
 
+// Per-run LLM token accounting, produced by lib/token-meter and shipped in
+// the SSE `done` payload. `estimatedTokens` is the subset that came from
+// character estimates (provider exposed no usage metadata) — never present
+// those as exact counts.
+export type TokenStats = {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  estimatedTokens: number;
+  totalTokens: number;
+  byPhase: Record<string, { inputTokens: number; outputTokens: number; totalTokens: number; requests: number }>;
+  rounds: number;
+  largestRequest: { totalTokens: number; phase: string; round: number } | null;
+  largestToolResult: { tool: string; chars: number; estimatedTokens: number } | null;
+  browserActions: number;
+};
+
 export type Msg = {
   role: "user" | "assistant";
   content: string;
@@ -10,6 +28,7 @@ export type Msg = {
   model?: string;
   skills?: string[];
   usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  tokenStats?: TokenStats;
   browserActions?: number;
   artifactActions?: number;
   modelRounds?: number;
