@@ -22,6 +22,8 @@ import { loadInstalledSkillsSync } from "@/lib/skills";
 import { assertPublicTarget } from "@/lib/ssrf";
 import { flushLogs } from "@/lib/tool-logs";
 import { appendEvidence, type EvidenceKind } from "@/lib/evidence-store";
+import { checkDuplicate, clearObservations, rememberObservation } from "@/lib/observation-dedup";
+import { compactToolResult, duplicateMarker, rewriteToolOutputs } from "@/lib/observation-compact";
 import { composeExecutionPrompt } from "@/lib/context";
 import { finishRunLog, logRunEvent, startRunLog } from "@/lib/run-log";
 import {
@@ -522,9 +524,14 @@ async function handleStream(
               lastAction: lastTool,
             });
           }
-           for (let ti = 0; ti < (step?.toolResults ?? []).length; ti += 1) {
+           const compactOverrides = new Map<string, string>();
+          for (let ti = 0; ti < (step?.toolResults ?? []).length; ti += 1) {
              const tr = (step?.toolResults ?? [])[ti];
              recordToolResult(runId, tr.toolName, tr.output);
+             const toolCallId =
+               typeof (tr as { toolCallId?: unknown }).toolCallId === "string"
+                 ? (tr as { toolCallId: string }).toolCallId
+                 : "";
              // Fix 1: failed or denied tool calls are NOT evidence. A click on
              // a nonexistent selector must not land its selector in the report.
              const trRec = tr as unknown as Record<string, unknown>;
@@ -550,6 +557,7 @@ async function handleStream(
               const out = tr.output as unknown;
               if (out && typeof out === "object") {
                 const output = out as Record<string, unknown>;
+                let evidenceId: string | undefined;
                 // Error pages are visits, never verification — a snapshot of
                 // a 404 must not mark its area Verified.
                 const pageText =
@@ -605,6 +613,25 @@ async function handleStream(
                 // Record evidence for server-side report validation.
                 if (isBrowserAction(toolName)) {
                   const url = typeof output.url === "string" ? output.url : "";
+                  // Phase 4B: content-addressed dedup. A byte-identical
+                  // observation of the same URL is suppressed from the model
+                  // context (any material page change changes the hash, so
+                  // cart adds, modals, and lazy loads are never deduplicated).
+                  const observationContent =
+                    toolName === "browser_snapshot" && typeof output.elements === "string"
+                      ? output.elements
+                      : toolName === "browser_get_text" && typeof output.text === "string"
+                        ? output.text
+                        : "";
+                  const dup = observationContent
+                    ? checkDuplicate(runId, url, observationContent)
+                    : null;
+                  if (dup?.duplicate && toolCallId) {
+                    compactOverrides.set(
+                      toolCallId,
+                      duplicateMarker(toolName, url, dup.previousEvidenceId ?? "the earlier observation")
+                    );
+                  } else {
                   // Full payload to the evidence store (phase 3, layer E) —
                   // retrievable by evidence ID after context compaction.
                   // The ledger below keeps its trimmed excerpt for reports.
@@ -624,7 +651,7 @@ async function handleStream(
                                 : toolName === "browser_navigate" || toolName === "browser_go_back"
                                   ? "navigation"
                                   : "action";
-                  void appendEvidence(runId, {
+                  const evidenceRecord = await appendEvidence(runId, {
                     kind,
                     tool: toolName,
                     url,
@@ -632,6 +659,11 @@ async function handleStream(
                     ...(toolName === "test_assert" ? { pass: output.pass === true } : {}),
                     data: out,
                   });
+                  evidenceId = evidenceRecord.id;
+                  if (observationContent) {
+                    rememberObservation(runId, url, observationContent, evidenceRecord.id);
+                  }
+                  }
                   let excerpt = "";
                   if (typeof output.elements === "string") excerpt = output.elements.slice(0, 2000);
                   else if (typeof output.text === "string") excerpt = output.text.slice(0, 2000);
@@ -661,6 +693,13 @@ async function handleStream(
                     ...(typeof output.failed === "number" ? { failed: output.failed } : {}),
                     ...(typeof output.error === "string" ? { error: output.error } : {}),
                   });
+                }
+                // Phase 4C/4D: large results enter the model context as a
+                // compact summary + evidence ID. evidence_read is exempt —
+                // the model explicitly asked for the full payload.
+                if (toolCallId && toolName !== "evidence_read" && !compactOverrides.has(toolCallId)) {
+                  const compacted = compactToolResult(toolName, out, evidenceId);
+                  if (compacted.compacted) compactOverrides.set(toolCallId, compacted.summary);
                 }
               }
               if (out && typeof out === "object" && "saved" in (out as Record<string, unknown>)) {
@@ -716,7 +755,10 @@ async function handleStream(
             }
           }
 
-          modelMessages = [...modelMessages, ...result.response.messages];
+          modelMessages = [
+            ...modelMessages,
+            ...rewriteToolOutputs(result.response.messages, compactOverrides),
+          ];
 
           // auto-shot hemat: hanya kalau pindah halaman (URL berubah) atau
           // navigate eksplisit — bukan tiap ketik/klik. Maks 6 per run.
@@ -971,6 +1013,7 @@ async function handleStream(
         rejectRunApprovals(runId);
         endRun(runId);
         clearRunTokens(runId);
+        clearObservations(runId);
         await browser.closeSession(runId).catch(() => null);
         await flushLogs().catch(() => null);
         await finishRunLog(runId, terminal).catch(() => null);

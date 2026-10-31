@@ -54,6 +54,18 @@ import {
   renderEvidenceRefs,
   renderSummary,
 } from "../src/lib/context";
+import {
+  checkDuplicate,
+  clearObservations,
+  fingerprint,
+  rememberObservation,
+} from "../src/lib/observation-dedup";
+import {
+  COMPACT_THRESHOLD,
+  compactToolResult,
+  duplicateMarker,
+  rewriteToolOutputs,
+} from "../src/lib/observation-compact";
 import { withSpan } from "../src/lib/telemetry";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
@@ -727,6 +739,110 @@ test("buildSystemContext totals instruction and rule sizes", () => {
   expect(sys.chars).toBe(5);
   expect(sys.instructions).toBe("abc");
   expect(sys.rules).toBe("de");
+});
+
+// ── phase 4: observation dedup + tool-result compaction ──
+
+test("dedup suppresses byte-identical observations but never changed page state", () => {
+  const runId = "dedup-run";
+  clearObservations(runId);
+  const url = "https://www.saucedemo.com/inventory.html";
+  const snap1 = "0: <button>ADD TO CART</button>\n1: <a href=\"/cart\">Cart</a>";
+  expect(checkDuplicate(runId, url, snap1).duplicate).toBe(false);
+  rememberObservation(runId, url, snap1, "ev_1");
+  // identical content + same URL → duplicate, points at the earlier id
+  const dup = checkDuplicate(runId, url, snap1);
+  expect(dup.duplicate).toBe(true);
+  expect(dup.previousEvidenceId).toBe("ev_1");
+  // material change (item added to cart → badge appears) → NOT a duplicate
+  const snap2 = snap1 + "\n2: <span class=\"shopping_cart_badge\">1</span>";
+  expect(checkDuplicate(runId, url, snap2).duplicate).toBe(false);
+  rememberObservation(runId, url, snap2, "ev_2");
+  // same content, different URL → NOT a duplicate
+  expect(checkDuplicate(runId, "https://www.saucedemo.com/cart.html", snap2).duplicate).toBe(false);
+  clearObservations(runId);
+  expect(checkDuplicate(runId, url, snap2).duplicate).toBe(false);
+});
+
+test("fingerprint is stable and content-sensitive", () => {
+  expect(fingerprint("abc")).toBe(fingerprint("abc"));
+  expect(fingerprint("abc")).not.toBe(fingerprint("abd"));
+  expect(fingerprint("abc")).toHaveLength(16);
+});
+
+test("compaction summarizes large snapshots with element counts and evidence id", () => {
+  const elements = Array.from(
+    { length: 60 },
+    (_, i) => `${i}: <button name="item-${i}">ADD TO CART</button>`
+  ).join("\n");
+  const out = { url: "https://www.saucedemo.com/inventory.html", title: "Swag Labs", elements };
+  expect(JSON.stringify(out).length).toBeGreaterThan(COMPACT_THRESHOLD);
+  const c = compactToolResult("browser_snapshot", out, "ev_12");
+  expect(c.compacted).toBe(true);
+  expect(c.summary).toContain("Swag Labs");
+  expect(c.summary).toContain("/inventory.html");
+  expect(c.summary).toContain("60 elements");
+  expect(c.summary).toContain("60 interactive");
+  expect(c.summary).toContain("ev_12");
+  expect(c.summary).not.toContain("ADD TO CART"); // raw payload stays out of context
+});
+
+test("compaction passes small results through untouched", () => {
+  const small = { url: "https://x.test/", elements: "0: <a href=\"/\">Home</a>" };
+  const c = compactToolResult("browser_snapshot", small, "ev_1");
+  expect(c.compacted).toBe(false);
+  expect(c.summary).toBe(JSON.stringify(small));
+  const click = { url: "https://x.test/cart", clicked: true };
+  expect(compactToolResult("browser_click", click).compacted).toBe(false);
+});
+
+test("compaction summarizes large text and always keeps screenshots out of context", () => {
+  const text = "Sauce Labs Backpack\n".repeat(500);
+  const c = compactToolResult(
+    "browser_get_text",
+    { url: "https://www.saucedemo.com/inventory.html", text },
+    "ev_13"
+  );
+  expect(c.compacted).toBe(true);
+  expect(c.summary).toContain("Visible text");
+  expect(c.summary).toContain("ev_13");
+  expect(c.summary).not.toContain("Backpack");
+
+  const shot = compactToolResult("browser_screenshot", {
+    url: "https://www.saucedemo.com/cart.html",
+    image: `data:image/png;base64,${"A".repeat(100_000)}`,
+  });
+  expect(shot.compacted).toBe(true);
+  expect(shot.summary).not.toContain("AAAA");
+  expect(shot.summary).toContain("Screenshot captured");
+});
+
+test("duplicate marker names the tool, url, and previous evidence id", () => {
+  const marker = duplicateMarker("browser_snapshot", "https://www.saucedemo.com/inventory.html", "ev_7");
+  expect(marker).toContain("Duplicate observation suppressed");
+  expect(marker).toContain("/inventory.html");
+  expect(marker).toContain("ev_7");
+  expect(marker).toContain("Do not re-read it");
+});
+
+test("rewriteToolOutputs replaces only the overridden tool results", () => {
+  const messages = [
+    { role: "assistant", content: "calling tools" },
+    {
+      role: "tool",
+      content: [
+        { type: "tool-result", toolCallId: "call_1", toolName: "browser_snapshot", output: { elements: "x".repeat(9000) } },
+        { type: "tool-result", toolCallId: "call_2", toolName: "browser_click", output: { clicked: true } },
+      ],
+    },
+  ] as unknown as Parameters<typeof rewriteToolOutputs>[0];
+  const overrides = new Map([["call_1", "COMPACTED ev_1"]]);
+  const rewritten = rewriteToolOutputs(messages, overrides);
+  const toolMsg = rewritten[1] as { content: { toolCallId: string; output: unknown }[] };
+  expect(toolMsg.content[0].output).toEqual({ type: "text", value: "COMPACTED ev_1" });
+  expect(toolMsg.content[1].output).toEqual({ clicked: true }); // untouched
+  // no overrides → same array instance, zero work
+  expect(rewriteToolOutputs(messages, new Map())).toBe(messages);
 });
 
 test("withSpan passes results through and rethrows without swallowing", async () => {

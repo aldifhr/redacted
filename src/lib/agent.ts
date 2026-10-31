@@ -1,6 +1,7 @@
 import { tool } from "ai";
 import { z } from "zod";
 import * as browser from "./browser";
+import { getEvidence } from "./evidence-store";
 import { saveSpec, runSpec, mergeCases, saveCaseResults, savePlanDocument, recordRun, listSpecs } from "./specs";
 import { saveFact, forgetFact } from "./memory";
 import { RUN_CANCELLED } from "./runs";
@@ -232,6 +233,18 @@ export function getBrowserTools(
       execute: wrap("browser_close", async () => {
         await browser.closeSession(sid ?? "");
         return { closed: true };
+      }),
+    }),
+    evidence_read: tool({
+      description:
+        "Retrieve the full payload of a previous browser observation by its evidence ID (ev_N). Use when a compacted summary or duplicate marker is not enough and you need the raw snapshot, text, or log again. Does not consume the browser-action budget.",
+      inputSchema: z.object({
+        id: z.string().describe("evidence ID, e.g. ev_12"),
+      }),
+      execute: wrap("evidence_read", async ({ id }: { id: string }) => {
+        const record = await getEvidence(sid ?? "", id);
+        if (!record) return { found: false, id };
+        return { found: true, id, kind: record.kind, url: record.url, data: record.data };
       }),
     }),
     browser_upload: tool({
