@@ -35,6 +35,25 @@ import {
   usageSnapshot,
 } from "../src/lib/token-meter";
 import { readRunLog, startRunLog, logRunEvent, finishRunLog } from "../src/lib/run-log";
+import {
+  appendEvidence,
+  clearEvidence,
+  countEvidence,
+  evidenceRef,
+  getEvidence,
+  readEvidence,
+} from "../src/lib/evidence-store";
+import {
+  buildExplorationState,
+  buildSummaryContext,
+  buildSystemContext,
+  buildTaskContext,
+  buildWorkingContext,
+  composeExecutionPrompt,
+  composeRoundMessages,
+  renderEvidenceRefs,
+  renderSummary,
+} from "../src/lib/context";
 import { withSpan } from "../src/lib/telemetry";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
@@ -501,6 +520,213 @@ test("token meter snapshot stays UI-compatible and unknown runs read as zero", (
   expect(estimateTokens(0)).toBe(0);
   expect(estimateTokens(-5)).toBe(0);
   clearRunTokens("meter-missing");
+});
+
+// ── evidence-store: full-fidelity evidence, independent of LLM context ──
+
+// Isolasi lewat EVIDENCE_DIR (temp dir) supaya tidak menyentuh .runs asli.
+async function withEvidenceDir(fn: () => Promise<void> | void) {
+  const dir = await fs.mkdtemp(join(tmpdir(), "evidence-"));
+  const prev = process.env.EVIDENCE_DIR;
+  process.env.EVIDENCE_DIR = dir;
+  try {
+    await fn();
+  } finally {
+    if (prev === undefined) delete process.env.EVIDENCE_DIR;
+    else process.env.EVIDENCE_DIR = prev;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("evidence store keeps full payloads, assigns stable ordered ids, filters by kind", async () => {
+  await withEvidenceDir(async () => {
+    const runId = "evidence-run-1";
+    const big = "x".repeat(50_000);
+    const snap = await appendEvidence(runId, {
+      kind: "snapshot",
+      tool: "browser_snapshot",
+      url: "https://www.saucedemo.com/inventory.html",
+      data: { url: "https://www.saucedemo.com/inventory.html", elements: big },
+    });
+    expect(snap.id).toBe("ev_1");
+    expect(snap.chars).toBeGreaterThan(50_000); // full payload, never truncated
+
+    const assert1 = await appendEvidence(runId, {
+      kind: "assert",
+      tool: "test_assert",
+      url: "https://www.saucedemo.com/cart.html",
+      selector: ".shopping_cart_badge",
+      pass: true,
+      data: { pass: true, actual: "badge shows 1" },
+    });
+    expect(assert1.id).toBe("ev_2");
+
+    const all = await readEvidence(runId);
+    expect(all.map((r) => r.id)).toEqual(["ev_1", "ev_2"]);
+    expect(await countEvidence(runId)).toBe(2);
+
+    const snaps = await readEvidence(runId, { kind: "snapshot" });
+    expect(snaps).toHaveLength(1);
+    expect(snaps[0].id).toBe("ev_1");
+    const byTool = await readEvidence(runId, { tool: "test_assert" });
+    expect(byTool[0].pass).toBe(true);
+
+    const fetched = await getEvidence(runId, "ev_1");
+    expect(fetched?.chars).toBe(snap.chars);
+    expect(await getEvidence(runId, "ev_missing")).toBeNull();
+
+    await clearEvidence(runId);
+    expect(await countEvidence(runId)).toBe(0);
+  });
+});
+
+test("evidence refs are compact one-liners that never carry the payload", async () => {
+  await withEvidenceDir(async () => {
+    const runId = "evidence-run-2";
+    const rec = await appendEvidence(runId, {
+      kind: "snapshot",
+      tool: "browser_snapshot",
+      url: "https://www.saucedemo.com/inventory.html",
+      data: { elements: "SECRET-PAYEYOAD".repeat(1000) },
+    });
+    const ref = evidenceRef(rec);
+    expect(ref.startsWith("ev_1 snapshot /inventory.html")).toBe(true);
+    expect(ref).toContain("chars");
+    expect(ref.length).toBeLessThan(200);
+    expect(ref).not.toContain("SECRET-PAYEYOAD");
+    expect(renderEvidenceRefs([rec])).toBe(ref);
+    await clearEvidence(runId);
+  });
+});
+
+// ── context layers: separation, bounded working window, compact summary ──
+
+test("context task layer derives objective, plan, criteria, and status", () => {
+  const task = buildTaskContext({
+    userRequest: "Open saucedemo, log in, explore all testable areas",
+    areas: ["login", "products", "cart", "checkout"],
+    completedAreas: ["login"],
+  });
+  expect(task.userRequest).toContain("saucedemo");
+  expect(task.objective).toContain("login, products, cart, checkout");
+  expect(task.plan).toEqual(["login", "products", "cart", "checkout"]);
+  expect(task.acceptanceCriteria).toHaveLength(4);
+  expect(task.status).toBe("1/4 areas verified");
+});
+
+test("context exploration state marks the first pending area current", () => {
+  const state = buildExplorationState({
+    currentUrl: "https://www.saucedemo.com/cart.html",
+    areas: ["login", "products", "cart", "checkout"],
+    completedAreas: ["login", "products"],
+    lastAction: "browser_click",
+    browserActions: 12,
+  });
+  expect(state.currentArea).toBe("cart");
+  expect(state.pendingAreas).toEqual(["cart", "checkout"]);
+  expect(state.completedAreas).toEqual(["login", "products"]);
+  expect(state.failedAreas).toEqual([]);
+  expect(state.browserActions).toBe(12);
+});
+
+test("context working layer bounds the recent-turn window", () => {
+  const turns = Array.from({ length: 10 }, (_, i) => ({ role: "user" as const, content: `turn ${i}` }));
+  const bounded = buildWorkingContext({ recentTurns: turns, currentObservation: "obs", maxTurns: 3 });
+  expect(bounded.recentTurns).toHaveLength(3);
+  expect(bounded.recentTurns[0].content).toBe("turn 7");
+  expect(bounded.turnCount).toBe(10); // full count preserved for accounting
+  const unbounded = buildWorkingContext({ recentTurns: turns, currentObservation: "obs" });
+  expect(unbounded.recentTurns).toHaveLength(10);
+});
+
+test("context summary renders evidence ids only, never raw payloads", () => {
+  const summary = buildSummaryContext({
+    task: "Explore SauceDemo",
+    currentUrl: "/inventory.html",
+    completedAreas: [{ area: "login", status: "VERIFIED", evidenceIds: ["ev_1", "ev_2"] }],
+    pendingAreas: ["products", "cart"],
+    failedAttempts: ["sort dropdown did not reorder"],
+    nextTask: "Explore product sorting",
+  });
+  const rendered = renderSummary(summary);
+  expect(rendered).toContain("ev_1");
+  expect(rendered).toContain("ev_2");
+  expect(rendered).toContain("Explore product sorting");
+  expect(rendered).toContain("sort dropdown did not reorder"); // failures survive
+  expect(rendered).not.toContain("<<<BEGIN UNTRUSTED"); // never raw page payloads
+});
+
+test("context summary preserves verified vs pending distinction", () => {
+  const summary = buildSummaryContext({
+    task: "Explore SauceDemo",
+    completedAreas: [{ area: "login", status: "VERIFIED", evidenceIds: ["ev_1"] }],
+    pendingAreas: ["products"],
+  });
+  const parsed = JSON.parse(renderSummary(summary));
+  expect(parsed.completedAreas[0].status).toBe("VERIFIED");
+  expect(parsed.pendingAreas).toEqual(["products"]);
+  expect(parsed.lastCompaction).toBeTruthy();
+});
+
+test("composeExecutionPrompt keeps instructions, scope, rules, and budget sentence", () => {
+  const scope = {
+    site: "https://www.saucedemo.com",
+    areas: ["login", "cart"],
+    priority: "medium" as const,
+    maxActions: Number.POSITIVE_INFINITY,
+    continue: false,
+  };
+  const prompt = composeExecutionPrompt({
+    systemPrompt: "SYSTEM-INSTRUCTIONS",
+    scope,
+    completedAreas: [],
+    currentArea: "login",
+    nextArea: "cart",
+  });
+  expect(prompt).toContain("SYSTEM-INSTRUCTIONS");
+  expect(prompt).toContain("# Current exploration scope");
+  expect(prompt).toContain('"areas"');
+  expect(prompt).toContain("Execute at most one tool call per model round");
+  expect(prompt).toContain("no browser-action budget");
+
+  const bounded = composeExecutionPrompt({
+    systemPrompt: "S",
+    scope: { ...scope, maxActions: 8 },
+    completedAreas: ["login"],
+    currentArea: "cart",
+    nextArea: "",
+  });
+  expect(bounded).toContain("Use at most 8 browser actions");
+});
+
+test("composeRoundMessages puts the task/state opening turn first", () => {
+  const task = buildTaskContext({ userRequest: "explore", areas: ["login"], completedAreas: [] });
+  const state = buildExplorationState({
+    currentUrl: "https://x.test/",
+    areas: ["login"],
+    completedAreas: [],
+    lastAction: "browser_navigate",
+    browserActions: 1,
+  });
+  const working = buildWorkingContext({
+    recentTurns: [{ role: "assistant", content: "prior" }],
+    currentObservation: "obs",
+  });
+  const messages = composeRoundMessages({ task, state, working });
+  expect(messages).toHaveLength(2);
+  expect(messages[0].role).toBe("user");
+  const opening = String(messages[0].content);
+  expect(opening).toContain("Task: explore");
+  expect(opening).toContain("url=https://x.test/");
+  expect(opening).toContain("browserActions=1");
+  expect(messages[1].content).toBe("prior");
+});
+
+test("buildSystemContext totals instruction and rule sizes", () => {
+  const sys = buildSystemContext("abc", "de");
+  expect(sys.chars).toBe(5);
+  expect(sys.instructions).toBe("abc");
+  expect(sys.rules).toBe("de");
 });
 
 test("withSpan passes results through and rethrows without swallowing", async () => {

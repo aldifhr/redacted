@@ -21,6 +21,8 @@ import { createApproval, isAlwaysAllowed, rejectRunApprovals } from "@/lib/appro
 import { loadInstalledSkillsSync } from "@/lib/skills";
 import { assertPublicTarget } from "@/lib/ssrf";
 import { flushLogs } from "@/lib/tool-logs";
+import { appendEvidence, type EvidenceKind } from "@/lib/evidence-store";
+import { composeExecutionPrompt } from "@/lib/context";
 import { finishRunLog, logRunEvent, startRunLog } from "@/lib/run-log";
 import {
   clearRunTokens,
@@ -190,7 +192,15 @@ async function handleStream(
   let completedAreas = previousCheckpoint?.completedAreas ?? [];
   const currentArea = scope.areas.find((area) => !completedAreas.includes(area)) ?? scope.areas[0];
   const nextArea = scope.areas.find((area) => area !== currentArea && !completedAreas.includes(area)) ?? "";
-  const executionPrompt = `${systemPrompt}\n\n---\n# Current exploration scope\n${JSON.stringify({ ...scope, completedAreas, currentArea, nextArea }, null, 2)}\nExplore every requested area, including currentArea, before declaring the exploration complete. An area is covered only after a browser tool result visibly reaches that area's URL/state; writing cases or inferring known locators does not count as exploration. Do not claim a flow was completed if its page was not reached and verified. Save incremental artifacts as each area is finished. ${Number.isFinite(scope.maxActions) ? `Use at most ${scope.maxActions} browser actions.` : "There is no browser-action budget; continue through all requested areas until coverage is complete or a real blocker occurs."} Execute at most one tool call per model round. Do not save the same artifact repeatedly unless adding genuinely new cases; after an artifact is saved, continue the browser flow.`;
+  // Execution prompt composed from typed context layers (audit phase 3):
+  // static instructions + scope block + rules.
+  const executionPrompt = composeExecutionPrompt({
+    systemPrompt,
+    scope,
+    completedAreas,
+    currentArea,
+    nextArea,
+  });
   // Skill exposure telemetry: which skill ids were loaded into this run's prompt.
   const runSkillIds = loadInstalledSkillsSync().map((s) => s.id);
   const wantsVisualEvidence = messages.some(
@@ -595,6 +605,33 @@ async function handleStream(
                 // Record evidence for server-side report validation.
                 if (isBrowserAction(toolName)) {
                   const url = typeof output.url === "string" ? output.url : "";
+                  // Full payload to the evidence store (phase 3, layer E) —
+                  // retrievable by evidence ID after context compaction.
+                  // The ledger below keeps its trimmed excerpt for reports.
+                  const kind: EvidenceKind =
+                    toolName === "browser_snapshot"
+                      ? "snapshot"
+                      : toolName === "browser_get_text"
+                        ? "text"
+                        : toolName === "browser_screenshot"
+                          ? "screenshot"
+                          : toolName === "test_assert"
+                            ? "assert"
+                            : toolName === "browser_console"
+                              ? "console"
+                              : toolName === "browser_network_log"
+                                ? "network"
+                                : toolName === "browser_navigate" || toolName === "browser_go_back"
+                                  ? "navigation"
+                                  : "action";
+                  void appendEvidence(runId, {
+                    kind,
+                    tool: toolName,
+                    url,
+                    ...(selector ? { selector } : {}),
+                    ...(toolName === "test_assert" ? { pass: output.pass === true } : {}),
+                    data: out,
+                  });
                   let excerpt = "";
                   if (typeof output.elements === "string") excerpt = output.elements.slice(0, 2000);
                   else if (typeof output.text === "string") excerpt = output.text.slice(0, 2000);
