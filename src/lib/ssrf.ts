@@ -12,13 +12,19 @@ export type SsrfOptions = {
 function isPrivateIPv4(ip: string): boolean {
   const parts = ip.split(".").map(Number);
   if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
-  const [a, b] = parts;
+  const [a, b, c] = parts;
   return (
     a === 10 ||
     a === 127 ||
     a === 0 ||
+    a >= 224 || // multicast + reserved + broadcast
+    (a === 100 && b >= 64 && b <= 127) || // CGNAT 100.64/10
     (a === 172 && b >= 16 && b <= 31) ||
     (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) || // 192.0.0.0/24, TEST-NET-1
+    (a === 198 && (b === 18 || b === 19)) || // benchmarking 198.18/15
+    (a === 198 && b === 51 && c === 100) || // TEST-NET-2
+    (a === 203 && b === 0 && c === 113) || // TEST-NET-3
     (a === 169 && b === 254)
   );
 }
@@ -35,11 +41,20 @@ function isPrivateIPv6(ip: string): boolean {
   );
 }
 
-// Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1) so mapped loopback/private
-// addresses cannot slip past the IPv6 check.
+// Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1 and the hex form
+// ::ffff:7f00:1) so mapped loopback/private addresses cannot slip past the
+// IPv6 check.
 function unwrapMappedIPv6(ip: string): string {
-  const m = ip.toLowerCase().match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  return m ? m[1] : ip;
+  const low = ip.toLowerCase();
+  const dotted = low.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) return dotted[1];
+  const hex = low.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hex) {
+    const hi = parseInt(hex[1], 16);
+    const lo = parseInt(hex[2], 16);
+    return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  }
+  return ip;
 }
 
 function isBlockedAddress(address: string, family: number, allowLocal: boolean): boolean {

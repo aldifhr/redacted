@@ -618,6 +618,96 @@ export async function goBack(sid?: string) {
   return { url: p.url() };
 }
 
+export type LiveFrame = {
+  data: string;
+  url: string;
+  width: number;
+  height: number;
+};
+
+// CDP screencast of an already-open page. Read-only: caller cannot drive the
+// browser through this stream. Frames are only produced when the page paints,
+// and each frame is acked so CDP itself throttles to the consumer.
+export async function startScreencast(
+  sid: string | undefined,
+  onFrame: (frame: LiveFrame) => void,
+  signal: AbortSignal,
+  onEnd?: () => void
+): Promise<() => Promise<void>> {
+  const target = sid ? sessions.get(sid)?.page : page;
+  if (!target || target.isClosed()) {
+    throw new Error(
+      sid ? "no live browser session for this run yet" : "browser is not open"
+    );
+  }
+  const cdp = await target.context().newCDPSession(target);
+  let stopped = false;
+  let ended = false;
+  const finish = () => {
+    if (ended) return;
+    ended = true;
+    try {
+      onEnd?.();
+    } catch {}
+  };
+  const stop = async () => {
+    if (stopped) return;
+    stopped = true;
+    try {
+      await cdp.send("Page.stopScreencast");
+    } catch {}
+    try {
+      await cdp.detach();
+    } catch {}
+    finish();
+  };
+  const onCdpFrame = (raw: unknown) => {
+    const event = raw as {
+      data?: string;
+      sessionId?: number;
+      metadata?: { deviceWidth?: number; deviceHeight?: number };
+    };
+    if (typeof event.sessionId === "number") {
+      void cdp
+        .send("Page.screencastFrameAck", { sessionId: event.sessionId })
+        .catch(() => null);
+    }
+    if (stopped || !event.data) return;
+    try {
+      onFrame({
+        data: event.data,
+        url: target.url(),
+        width: event.metadata?.deviceWidth ?? 1280,
+        height: event.metadata?.deviceHeight ?? 800,
+      });
+    } catch {
+      void stop();
+    }
+  };
+  cdp.on("Page.screencastFrame", onCdpFrame);
+  const onPageClose = () => {
+    void stop();
+  };
+  target.once("close", onPageClose);
+  signal.addEventListener("abort", () => void stop(), { once: true });
+  try {
+    await cdp.send("Page.startScreencast", {
+      format: "jpeg",
+      quality: 55,
+      maxWidth: 1280,
+      maxHeight: 800,
+      everyNthFrame: 1,
+    });
+  } catch (e) {
+    target.off("close", onPageClose);
+    try {
+      await cdp.detach();
+    } catch {}
+    throw e;
+  }
+  return stop;
+}
+
 export async function scrollPage(
   direction: "down" | "up" | "top" | "bottom" = "down",
   pixels = 600,

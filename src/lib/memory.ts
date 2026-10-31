@@ -99,10 +99,15 @@ export function forgetFact(query: string): { removed: number; total: number } {
   if (!q) throw new Error("keyword cannot be empty");
   const raw = readFile();
   const lines = raw.split("\n");
+  const factOf = (line: string) => line.trim().slice(2).trim().toLowerCase();
+  // Exact line match wins; a keyword search is only the fallback, so deleting
+  // one fact can never take unrelated facts that merely share the words.
+  const exact = lines.some((l) => l.trim().startsWith("- ") && factOf(l) === q);
   const kept = lines.filter((l) => {
     const t = l.trim();
     if (!t.startsWith("- ")) return true;
-    return !t.slice(2).toLowerCase().includes(q);
+    const fact = factOf(l);
+    return exact ? fact !== q : !fact.includes(q);
   });
   const removed = lines.length - kept.length;
   if (removed > 0) writeFile(kept.join("\n"));

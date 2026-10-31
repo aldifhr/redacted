@@ -2,13 +2,15 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { generateObject } from "ai";
 import { getModel, PROVIDERS, type ProviderId } from "@/lib/providers";
+import { resolveKey } from "@/lib/key-vault";
 import { listFacts, saveFact } from "@/lib/memory";
 import { guardApi } from "@/lib/api-guard";
 
 const ConsolidateSchema = z.object({
   provider: z.enum(["openai", "anthropic"]),
   model: z.string().max(120).optional(),
-  apiKey: z.string().min(1).max(500),
+  // opsional: kosong/marker → key dari vault server
+  apiKey: z.string().max(500).optional().default(""),
   baseUrl: z.string().max(500).optional().default(""),
   messages: z
     .array(z.object({ role: z.string().max(20), content: z.string().max(15000) }))
@@ -24,14 +26,14 @@ export async function POST(req: Request) {
   if (blocked) return blocked;
   const parsed = ConsolidateSchema.safeParse(await req.json().catch(() => ({})));
   if (!parsed.success) {
-    return NextResponse.json({ error: "provider, apiKey, and messages are required" }, { status: 400 });
+    return NextResponse.json({ error: "provider and messages are required" }, { status: 400 });
   }
   const { provider, model, apiKey, baseUrl, messages } = parsed.data;
   const chosenModel = model || PROVIDERS[provider as ProviderId].models[0];
 
   let llm: ReturnType<typeof getModel>;
   try {
-    llm = getModel(provider as ProviderId, chosenModel, apiKey, baseUrl);
+    llm = getModel(provider as ProviderId, chosenModel, resolveKey(provider, apiKey), baseUrl);
   } catch (e) {
     return NextResponse.json(
       { error: e instanceof Error ? e.message : "model configuration failed" },

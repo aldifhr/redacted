@@ -78,11 +78,13 @@ export function areaForUrl(value: unknown): string | null {
   try {
     const path = new URL(value).pathname.toLowerCase();
     if (path.includes("checkout")) return "checkout";
-    if (path.includes("cart")) return "cart";
+    // Segment-scoped so "/cartoon" or "/carted" never maps to the cart area.
+    if (/(^|\/)cart(\/|$)/.test(path)) return "cart";
     if (path.includes("dynamic-catalog")) return "dynamic catalog";
     if (path.includes("inventory")) return "products";
-    if (path === "/" || path.endsWith("/index.html")) return "login";
   } catch {}
+  // The site root is not inherently a login page; urlMatchesArea resolves
+  // root-level areas (login/home/landing) against the requested area name.
   return null;
 }
 
@@ -93,12 +95,21 @@ export function urlMatchesArea(url: unknown, area: string): boolean {
   const direct = areaForUrl(url);
   if (direct && norm(direct) === norm(area)) return true;
   try {
-    const segs = new URL(url).pathname.toLowerCase().split(/[/\-_.]+/).filter(Boolean);
+    const parsedUrl = new URL(url);
+    const path = parsedUrl.pathname.toLowerCase();
+    const root = path === "/" || path.endsWith("/index.html");
     const want = compact(area);
     if (!want || want.length < 3) return false;
+    if (root && (want === "login" || want === "home" || want === "homepage" || want === "landing")) {
+      return true;
+    }
+    const segs = path.split(/[/\-_.]+/).filter(Boolean);
     return segs.some((sg) => {
       const c = compact(sg);
-      return c.length >= 3 && (c.includes(want) || want.includes(c));
+      // Exact token, or a segment covered by a more specific area name
+      // ("dynamic catalog" ⊇ "catalog"). No substring match, so "cartoon"
+      // can never verify the "cart" area.
+      return c.length >= 3 && (c === want || want.includes(c));
     });
   } catch {
     return false;
@@ -117,7 +128,9 @@ function pathOf(url: string): string {
 // content markers (not HTTP status — the tool layer doesn't expose it).
 const ERROR_PAGE_MARKERS = [
   "404",
-  "not found",
+  "page not found",
+  "404 not found",
+  "could not be found",
   "page could not be found",
   "application error",
   "something went wrong",

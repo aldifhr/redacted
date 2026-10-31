@@ -2,6 +2,8 @@ import { NextRequest } from "next/server";
 import { z } from "zod";
 import { generateText, generateObject, stepCountIs, type ModelMessage } from "ai";
 import { getModel, PROVIDERS } from "@/lib/providers";
+import { resolveKey } from "@/lib/key-vault";
+import { withSpan } from "@/lib/telemetry";
 import {
   getBrowserTools,
   statusLabel,
@@ -19,6 +21,7 @@ import { createApproval, isAlwaysAllowed, rejectRunApprovals } from "@/lib/appro
 import { loadInstalledSkillsSync } from "@/lib/skills";
 import { assertPublicTarget } from "@/lib/ssrf";
 import { flushLogs } from "@/lib/tool-logs";
+import { finishRunLog, logRunEvent, startRunLog } from "@/lib/run-log";
 import { parseExplorationScope, readExplorationCheckpoint, readLatestCheckpoint, saveExplorationCheckpoint } from "@/lib/exploration";
 import {
   ReportDataSchema,
@@ -36,6 +39,8 @@ export const maxDuration = 300;
 // request when a bounded chunk is desired; cancellation and step timeouts
 // remain the backstops for an intentionally open-ended exploration.
 const MAX_STEPS = Number(process.env.MAX_AGENT_STEPS) || Number.POSITIVE_INFINITY;
+// Backstop when no action budget is set: the model-round loop must still end.
+const MAX_UNBOUNDED_MODEL_ROUNDS = Number(process.env.MAX_MODEL_ROUNDS) || 200;
 
 function phaseFor(toolName?: string): string {
   if (!toolName) return "Explore";
@@ -94,6 +99,7 @@ const StreamBodySchema = z.object({
   model: z.string().max(120).optional(),
   apiKey: z.string().max(500).optional().default(""),
   baseUrl: z.string().max(500).optional().default(""),
+  sessionId: z.string().max(100).optional().default(""),
 });
 
 // POST /api/chat/stream — SSE. Event:
@@ -137,6 +143,7 @@ async function handleStream(
     model?: string;
     apiKey: string;
     baseUrl: string;
+    sessionId: string;
   }
 ) {
   const {
@@ -145,6 +152,7 @@ async function handleStream(
     model,
     apiKey = "",
     baseUrl = "",
+    sessionId = "",
   } = body;
 
   const chosenModel = model || PROVIDERS[provider].models[0];
@@ -182,7 +190,8 @@ async function handleStream(
   );
   let llm: ReturnType<typeof getModel>;
   try {
-    llm = getModel(provider, chosenModel, apiKey, baseUrl);
+    // apiKey kosong/marker → pakai key dari vault server (lihat lib/key-vault).
+    llm = getModel(provider, chosenModel, resolveKey(provider, apiKey), baseUrl);
   } catch (e) {
     return Response.json(
       { error: e instanceof Error ? e.message : "model configuration failed" },
@@ -192,11 +201,15 @@ async function handleStream(
 
   const encoder = new TextEncoder();
   const runId = createRun();
+  // Durable event log: lets the UI reconnect to a run after a reload.
+  await startRunLog(runId, sessionId).catch(() => null);
   // client disconnect (tutup tab / abort fetch) otomatis = cancel run
   req.signal.addEventListener("abort", () => cancelRun(runId));
   const stream = new ReadableStream({
     async start(controller) {
-      let closed = false;      const safeClose = () => {
+      let closed = false;
+      let terminal: "done" | "aborted" | "error" = "error";
+      const safeClose = () => {
         if (!closed) {
           closed = true;
           try {
@@ -205,11 +218,15 @@ async function handleStream(
         }
       };
       const send = (event: string, data: unknown) => {
+        if (event === "done") terminal = "done";
+        else if (event === "aborted") terminal = "aborted";
+        else if (event === "error") terminal = "error";
         if (closed || req.signal.aborted) return;
         try {
           controller.enqueue(
             encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
           );
+          if (event !== "init") void logRunEvent(runId, event, data);
         } catch {
           closed = true;
         }
@@ -227,12 +244,15 @@ async function handleStream(
         }
       }, 15_000);
 
+      // Satu span untuk seluruh run; tiap tool call jadi child span
+      // (dibuat di lib/agent.ts), jadi trace tree-nya utuh.
       try {
+        await withSpan("chat.run", async () => {
         const delegateTask = async (task: string) => {
           if (isCancelled(runId)) throw new Error(RUN_CANCELLED);
            send("status", { label: "Delegating QA subtask…", thinking: "Breaking the browser work into a smaller QA subtask." });
           const subTools = getBrowserTools(
-             (toolName, input) => send("status", { label: `Sub-agent: ${statusLabel(toolName, input)}`, thinking: thinkingFor(toolName, input), phase: phaseFor(toolName), agent: "sub" }),
+             (toolName, input) => send("status", { label: `Sub-agent: ${statusLabel(toolName, input)}`, thinking: thinkingFor(toolName, input), phase: phaseFor(toolName), agent: "sub", tool: toolName }),
             () => isCancelled(runId),
             undefined,
             undefined,
@@ -277,7 +297,7 @@ async function handleStream(
              toolCalls.push({ tool: toolName, input });
              lastLabel = statusLabel(toolName, input);
              lastPhase = phaseFor(toolName);
-             send("status", { label: lastLabel, thinking: thinkingFor(toolName, input), phase: lastPhase, agent: "main" });
+             send("status", { label: lastLabel, thinking: thinkingFor(toolName, input), phase: lastPhase, agent: "main", tool: toolName });
           },
           () => isCancelled(runId),
           delegateTask,
@@ -302,6 +322,10 @@ async function handleStream(
         const testRuns: TestRunSummary[] = [];
         let fullText = "";
         let usage: unknown = null;
+        let tokensUsed = 0;
+        // Hard per-run token ceiling. Generous by default; override with
+        // MAX_RUN_TOKENS (0 disables the ceiling).
+        const tokenBudget = Math.max(0, Number(process.env.MAX_RUN_TOKENS ?? 1_000_000) || 0);
         let modelRounds = 0;
         let lastShotUrl: string | null = null;
         let lastLabel = "Working…";
@@ -313,7 +337,7 @@ async function handleStream(
         // loop retry (or finish with a partial summary after repeated timeouts).
         const STEP_TIMEOUT_MS = 120_000;
         let capped = false;
-        let stopReason: "completed" | "action_limit" | "model_timeout" | "model_round_limit" = "completed";
+        let stopReason: "completed" | "action_limit" | "model_timeout" | "model_round_limit" | "budget_limit" = "completed";
         let earlyStops = 0;
         const MAX_AUTO_SHOTS = 6;
         await saveExplorationCheckpoint({
@@ -327,7 +351,7 @@ async function handleStream(
 
         // Artifact saves and the final text need rounds of their own; they do
         // not consume the browser-action budget.
-        const maxModelRounds = Number.isFinite(actionLimit) ? actionLimit + 8 : Number.POSITIVE_INFINITY;
+        const maxModelRounds = Number.isFinite(actionLimit) ? actionLimit + 8 : MAX_UNBOUNDED_MODEL_ROUNDS;
         const reportingTools = Object.fromEntries(
           Object.entries(tools).filter(([name]) => !isBrowserAction(name))
         );
@@ -337,6 +361,17 @@ async function handleStream(
           if (isCancelled(runId)) {
             send("aborted", {});
             return;
+          }
+          if (tokenBudget > 0 && tokensUsed >= tokenBudget) {
+            stopReason = "budget_limit";
+            capped = true;
+            send("status", {
+              label: "Token budget reached",
+              thinking: `Run stopped after ${tokensUsed.toLocaleString()} tokens (limit ${tokenBudget.toLocaleString()}).`,
+              phase: "Reporting",
+              agent: "main",
+            });
+            break;
           }
           const browserActionCount = toolCalls.filter((call) => isBrowserAction(call.tool)).length;
           // Warn based on real browser actions, not model rounds consumed by
@@ -396,7 +431,22 @@ async function handleStream(
            consecutiveTimeouts = 0;
           modelRounds += 1;
           const step = result.steps[0];
-          usage = result.usage ?? usage;
+          if (result.usage) {
+            const prev = (usage ?? {}) as {
+              inputTokens?: number;
+              outputTokens?: number;
+              totalTokens?: number;
+            };
+            const inputTokens = (prev.inputTokens ?? 0) + (result.usage.inputTokens ?? 0);
+            const outputTokens = (prev.outputTokens ?? 0) + (result.usage.outputTokens ?? 0);
+            usage = {
+              inputTokens,
+              outputTokens,
+              totalTokens: inputTokens + outputTokens,
+            };
+            tokensUsed = inputTokens + outputTokens;
+            send("usage", usage);
+          }
           if (result.text) fullText += (fullText ? "\n" : "") + result.text;
           // Raw model reasoning: stream the step's actual text instead of
           // only the canned per-tool summary, so "Agent thinking" is verbatim.
@@ -748,7 +798,9 @@ async function handleStream(
             ? `\n\n---\nStopped early: reached the ${actionLimit}-browser-action limit before finishing. Ask me to continue from where it left off.`
             : stopReason === "model_round_limit"
               ? `\n\n---\nStopped after ${maxModelRounds} model rounds with ${finalBrowserActions} browser actions. Ask me to continue from where it left off.`
-              : "";
+              : stopReason === "budget_limit"
+                ? `\n\n---\nStopped early: this run reached its ${tokenBudget.toLocaleString()}-token budget (${tokensUsed.toLocaleString()} used). Raise MAX_RUN_TOKENS or split the request.`
+                : "";
         const runFacts = `\n\n---\nAUTHORITATIVE EXPLORATION STATUS: ${coverageStatus}. Run facts (server-verified): ${finalBrowserActions} browser actions executed. Verified areas: ${coveredAreas.length ? coveredAreas.join(", ") : "none"}.${visitedAreas.filter((area) => !coveredAreas.includes(area)).length ? ` Visited only: ${visitedAreas.filter((area) => !coveredAreas.includes(area)).join(", ")}.` : ""}${scope.areas.filter((area) => !coveredAreas.includes(area)).length ? ` Next requested area: ${scope.areas.find((area) => !coveredAreas.includes(area))}.` : " All requested areas verified."}${scopeWarning ? ` Warning: ${scopeWarning}` : ""}`;
         send("done", {
           text:
@@ -784,6 +836,12 @@ async function handleStream(
           })),
           testRuns,
         });
+        }, {
+          "provider": provider,
+          "model": chosenModel,
+          ...(sessionId ? { "session.id": sessionId } : {}),
+          "run.id": runId,
+        });
       } catch (e) {
         if (
           isCancelled(runId) ||
@@ -805,6 +863,7 @@ async function handleStream(
         endRun(runId);
         await browser.closeSession(runId).catch(() => null);
         await flushLogs().catch(() => null);
+        await finishRunLog(runId, terminal).catch(() => null);
         safeClose();
       }
     },

@@ -1,6 +1,6 @@
 "use client";
 
-import { Bot, Loader2, MessageSquare, Plus, Square, Trash2, X } from "lucide-react";
+import { Bot, CircleAlert, Loader2, MessageSquare, Plus, Square, Trash2, X } from "lucide-react";
 import { fmtTime } from "@/lib/store";
 import type { Session } from "@/lib/store";
 
@@ -9,6 +9,7 @@ type SidebarProps = {
   sessions: Session[];
   activeId: string | null;
   runningIds: Record<string, string>;
+  pendingApprovals: Record<string, { runId: string; id: string }>;
   onClose: () => void;
   onNewChat: () => void;
   onSwitchSession: (id: string) => void;
@@ -21,6 +22,7 @@ export default function Sidebar({
   sessions,
   activeId,
   runningIds,
+  pendingApprovals,
   onClose,
   onNewChat,
   onSwitchSession,
@@ -70,41 +72,45 @@ export default function Sidebar({
           {sessions.map((s) => {
             const isActive = s.id === activeId;
             const running = runningIds[s.id] !== undefined;
+            const needsApproval = pendingApprovals[s.id] !== undefined;
             return (
               <div
                 key={s.id}
-                role="button"
-                tabIndex={0}
-                onClick={() => onSwitchSession(s.id)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    onSwitchSession(s.id);
-                  }
-                }}
-                aria-label={`Open chat: ${s.title}`}
-                className={`group flex cursor-pointer items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition active:scale-[0.98] ${
+                className={`group flex items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition active:scale-[0.98] ${
                   isActive
                     ? "border-white/40 bg-white/10"
                     : "border-transparent hover:bg-white/5"
                 }`}
               >
-                {running ? (
-                  <Loader2 size={15} className="shrink-0 animate-spin text-white" />
-                ) : (
-                  <MessageSquare
-                    size={15}
-                    className={`shrink-0 ${isActive ? "text-white" : "text-zinc-600"}`}
-                  />
-                )}
-                <div className="min-w-0 flex-1">
-                  <p className={`truncate text-[13px] font-medium ${isActive ? "text-white" : "text-zinc-400"}`}>
-                    {s.title}
-                  </p>
-                  <p className="text-[10px] text-zinc-600">
-                    {running ? "running in background…" : `${s.messages.length} messages • ${fmtTime(s.updatedAt)}`}
-                  </p>
-                </div>
+                <button
+                  onClick={() => onSwitchSession(s.id)}
+                  aria-label={`Open chat: ${s.title}`}
+                  aria-current={isActive ? "page" : undefined}
+                  className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
+                >
+                  {needsApproval ? (
+                    <CircleAlert size={15} className="shrink-0 text-amber-300" />
+                  ) : running ? (
+                    <Loader2 size={15} className="shrink-0 animate-spin text-white" />
+                  ) : (
+                    <MessageSquare
+                      size={15}
+                      className={`shrink-0 ${isActive ? "text-white" : "text-zinc-600"}`}
+                    />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <p className={`truncate text-[13px] font-medium ${isActive ? "text-white" : "text-zinc-400"}`}>
+                      {s.title}
+                    </p>
+                    <p className={`text-[10px] ${needsApproval ? "text-amber-300" : "text-zinc-600"}`}>
+                      {needsApproval
+                        ? "approval needed · click to review"
+                        : running
+                          ? "running in background…"
+                          : `${s.messages.length} messages • ${fmtTime(s.updatedAt)}`}
+                    </p>
+                  </div>
+                </button>
                 {running && (
                   <button
                     onClick={(e) => {

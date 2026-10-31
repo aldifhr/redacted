@@ -1,7 +1,7 @@
 /* eslint-disable @next/next/no-img-element */
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -16,10 +16,14 @@ import {
   Loader2,
   RefreshCw,
   RotateCcw,
+  ShieldCheck,
   Sparkles,
+  Trash2,
 } from "lucide-react";
-import { DEFAULT_BASE_URLS, PROVIDERS, ProviderId } from "@/lib/providers";
-import { Settings, ATTACHMENT_CAPS, defaultSettings, loadSettings, saveSettings } from "@/lib/store";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { DEFAULT_BASE_URLS, PROVIDERS, VAULT_MARKER, ProviderId } from "@/lib/providers";
+import { Settings, ATTACHMENT_CAPS, loadSettings } from "@/lib/store";
+import { useAppStore } from "@/lib/app-store";
 import { useToast } from "@/components/ui/toast";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -44,119 +48,219 @@ const section = {
   show: { opacity: 1, y: 0 },
 };
 
+type KeyInfo = { provider: ProviderId; fingerprint: string; updatedAt: number };
+
 export default function SettingsPage() {
-  const [settings, setSettings] = useState<Settings>(defaultSettings);
+  // Settings tinggal di zustand store (yang sekarang persist ke localStorage),
+  // jadi /chat dan halaman lain langsung lihat perubahan tanpa reload.
+  const settings = useAppStore((state) => state.settings);
+  const setSettings = useAppStore((state) => state.setSettings);
   const [showKey, setShowKey] = useState(false);
   const [saved, setSaved] = useState(false);
+  // Key yang sedang diketik — tidak pernah masuk localStorage; langsung
+  // dikirim ke POST /api/keys (server vault) begitu debounce selesai.
+  const [draft, setDraft] = useState("");
   const [testing, setTesting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [test, setTest] = useState<{ title: string; url: string; image: string } | null>(null);
   const [testError, setTestError] = useState("");
-  const [liveModels, setLiveModels] = useState<string[] | null>(null);
-  const [modelsLoading, setModelsLoading] = useState(false);
-  const [modelsError, setModelsError] = useState("");
+  const [modelFilter, setModelFilter] = useState("");
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { success, error: showError } = useToast();
+  const queryClient = useQueryClient();
 
-  // hidrasi deferred agar render pertama identik SSR
-  useEffect(() => {
-    const t = setTimeout(() => setSettings(loadSettings()), 0);
-    return () => clearTimeout(t);
-  }, []);
+  const provider = settings.provider;
+  const baseUrl = settings.baseUrls[provider] ?? "";
+  const draftKey = draft.trim();
 
-  function patch(p: Partial<Settings>) {
-    setSettings((prev) => {
-      const next = { ...prev, ...p };
-      saveSettings(next);
-      return next;
-    });
-    setSaved(true);
-    if (savedTimer.current) clearTimeout(savedTimer.current);
-    savedTimer.current = setTimeout(() => setSaved(false), 1200);
-  }
+  // ── Query: daftar key tersimpan di server (fingerprint saja) ──
+  const keysQuery = useQuery({
+    queryKey: ["keys"],
+    queryFn: async (): Promise<KeyInfo[]> => {
+      const r = await fetch("/api/keys");
+      const d = await r.json();
+      return Array.isArray(d.keys) ? (d.keys as KeyInfo[]) : [];
+    },
+  });
+  const vault = useMemo<Partial<Record<ProviderId, string>>>(() => {
+    const map: Partial<Record<ProviderId, string>> = {};
+    for (const k of keysQuery.data ?? []) map[k.provider] = k.fingerprint;
+    return map;
+  }, [keysQuery.data]);
+  const vaultFingerprint = vault[provider] ?? "";
+  const hasKey = !!draftKey || !!vaultFingerprint;
+
+  // ── Mutation: simpan / hapus key di vault server ──
+  const saveMutation = useMutation({
+    mutationFn: async (vars: { provider: ProviderId; apiKey: string; baseUrl: string }) => {
+      const r = await fetch("/api/keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(vars),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || "Failed to save key");
+      return d as { fingerprint: string };
+    },
+    onSuccess: (d, vars) => {
+      setDraft("");
+      void queryClient.invalidateQueries({ queryKey: ["keys"] });
+      success(
+        "API key saved on server",
+        `${PROVIDERS[vars.provider].label} • sha256:${d.fingerprint}`
+      );
+    },
+    onError: (e) => {
+      showError("Key not saved", e instanceof Error ? e.message : "Failed to save key");
+    },
+  });
+
+  const removeMutation = useMutation({
+    mutationFn: async (p: ProviderId) => {
+      const r = await fetch("/api/keys", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: p }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || "Failed to remove key");
+      return d;
+    },
+    onSuccess: (_d, p) => {
+      void queryClient.invalidateQueries({ queryKey: ["keys"] });
+      success("API key removed", `${PROVIDERS[p].label} key deleted from this server.`);
+    },
+    onError: (e) => {
+      showError("Remove failed", e instanceof Error ? e.message : "Failed");
+    },
+  });
+
+  // ── Query: daftar model live ──
+  // Selalu dari vault (server yang resolve key). queryKey memuat fingerprint:
+  // begitu key diganti, key berubah → model otomatis dimuat ulang.
+  const modelsQuery = useQuery({
+    queryKey: ["models", provider, baseUrl, vaultFingerprint],
+    queryFn: async (): Promise<string[]> => {
+      const r = await fetch("/api/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, apiKey: VAULT_MARKER, baseUrl }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || "Failed to load models");
+      return Array.isArray(d.models) ? (d.models as string[]) : [];
+    },
+    // Tanpa key tersimpan tidak ada yang bisa dilisting.
+    enabled: !!vaultFingerprint,
+    retry: false,
+  });
+  const liveModels = modelsQuery.data ?? null;
+  const modelsError = modelsQuery.isError
+    ? ((modelsQuery.error as Error)?.message ?? "Failed to load models")
+    : "";
+
+  const patch = useCallback(
+    (p: Partial<Settings>) => {
+      // baca dari store, bukan closure, supaya patch berturut-turut aman
+      setSettings({ ...useAppStore.getState().settings, ...p });
+      setSaved(true);
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      savedTimer.current = setTimeout(() => setSaved(false), 1200);
+    },
+    [setSettings]
+  );
 
   function changeProvider(p: ProviderId) {
-    setLiveModels(null);
-    setModelsError("");
     patch({ provider: p, model: PROVIDERS[p].models[0] });
     success("Provider changed", PROVIDERS[p].label);
   }
 
-  async function loadModels(manual: boolean) {
-    const key = settings.keys[settings.provider]?.trim();
-    if (!key) {
-      if (manual) {
-         setModelsError("Enter an API key first");
-         showError("Error", "Enter an API key first");
-      }
+  function refreshModels() {
+    if (!vaultFingerprint) {
+      showError("Error", "Enter an API key first");
       return;
     }
-    setModelsLoading(true);
-    if (manual) setModelsError("");
-    try {
-      const r = await fetch("/api/models", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider: settings.provider,
-          apiKey: key,
-          baseUrl: settings.baseUrls[settings.provider] ?? "",
-        }),
-      });
-      const d = await r.json();
-       if (!r.ok) throw new Error(d.error || "Failed to load models");
-      setLiveModels(d.models);
-      setModelsError("");
-       if (manual) success("Models loaded", `${d.models.length} models available`);
-      // kalau model tersimpan tidak ada di daftar live, pakai yang pertama
-      if (!d.models.includes(settings.model)) {
-        patch({ model: d.models[0] });
-      }
-    } catch (e) {
-      setLiveModels(null);
-       const msg = e instanceof Error ? e.message : "Failed";
-      if (manual) {
-        setModelsError(msg);
-         showError("Model loading error", msg);
-      }
-    } finally {
-      setModelsLoading(false);
-    }
+    void modelsQuery.refetch().then((r) => {
+      if (r.data?.length) success("Models loaded", `${r.data.length} models available`);
+    });
   }
 
-  // auto-fetch daftar model saat provider / key / base URL berubah (debounce)
-  const provider = settings.provider;
-  const apiKey = settings.keys[provider] ?? "";
-  const baseUrl = settings.baseUrls[provider] ?? "";
+  function removeKey() {
+    removeMutation.mutate(provider);
+  }
+
+  // hidrasi deferred agar render pertama identik SSR + migrasi key lama
   useEffect(() => {
-    const key = apiKey.trim();
-    const t = setTimeout(async () => {
-      if (!key) {
-        setLiveModels(null);
-        return;
-      }
-      setModelsLoading(true);
-      try {
-        const r = await fetch("/api/models", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider, apiKey: key, baseUrl }),
-        });
-        const d = await r.json();
-        if (r.ok && d.models?.length) {
-          setLiveModels(d.models);
-          setModelsError("");
-        } else {
-          setLiveModels(null);
+    const t = setTimeout(() => {
+      const loaded = loadSettings();
+      setSettings(loaded);
+      // Migrasi sekali jalan: key mentah lama di localStorage dipindah ke
+      // vault server, lalu localStorage hanya menyimpan marker.
+      const legacy = (Object.keys(PROVIDERS) as ProviderId[])
+        .map((p) => ({ p, key: (loaded.keys[p] ?? "").trim() }))
+        .filter((x) => x.key && x.key !== VAULT_MARKER);
+      if (!legacy.length) return;
+      void (async () => {
+        const moved: ProviderId[] = [];
+        for (const { p, key } of legacy) {
+          try {
+            const r = await fetch("/api/keys", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ provider: p, apiKey: key, baseUrl: loaded.baseUrls[p] ?? "" }),
+            });
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.error || "rejected");
+            moved.push(p);
+            success("API key moved to server", `${PROVIDERS[p].label} • sha256:${d.fingerprint}`);
+          } catch (e) {
+            showError(
+              "Could not move key to server",
+              `${PROVIDERS[p].label}: ${e instanceof Error ? e.message : "failed"}`
+            );
+          }
         }
-      } catch {
-        setLiveModels(null);
-      } finally {
-        setModelsLoading(false);
-      }
+        if (moved.length) {
+          const current = useAppStore.getState().settings;
+          setSettings({
+            ...current,
+            keys: {
+              ...current.keys,
+              ...Object.fromEntries(moved.map((p) => [p, VAULT_MARKER])),
+            },
+          });
+          void queryClient.invalidateQueries({ queryKey: ["keys"] });
+        }
+      })();
+    }, 0);
+    return () => clearTimeout(t);
+  }, [setSettings, success, showError, queryClient]);
+
+  // Debounce: key yang diketik disimpan ke vault server (divalidasi ke
+  // provider). Daftar model di-handle modelsQuery — fingerprint berubah →
+  // queryKey berubah → model dimuat ulang otomatis.
+  const saveMutateRef = useRef(saveMutation.mutate);
+  useEffect(() => {
+    saveMutateRef.current = saveMutation.mutate;
+  }, [saveMutation.mutate]);
+  useEffect(() => {
+    if (!draftKey) return;
+    const t = setTimeout(() => {
+      saveMutateRef.current({ provider, apiKey: draftKey, baseUrl });
     }, 900);
     return () => clearTimeout(t);
-  }, [provider, apiKey, baseUrl]);
+  }, [provider, draftKey, baseUrl]);
+
+  // kalau model tersimpan tidak ada di daftar live, pakai yang pertama.
+  // Defer satu tick: hindari cascading render sinkron dari dalam effect.
+  useEffect(() => {
+    const list = modelsQuery.data;
+    if (!list?.length) return;
+    if (!list.includes(settings.model)) {
+      const t = setTimeout(() => patch({ model: list[0] }), 0);
+      return () => clearTimeout(t);
+    }
+  }, [modelsQuery.data, settings.model, patch]);
 
   async function testBrowser() {
     setTesting(true);
@@ -215,6 +319,11 @@ export default function SettingsPage() {
     : fallback.includes(model)
       ? fallback
       : [model, ...fallback];
+  const filterQuery = modelFilter.trim().toLowerCase();
+  const visibleOptions = filterQuery
+    ? options.filter((m) => m.toLowerCase().includes(filterQuery))
+    : options;
+  const isCustomModel = !!model && !(liveModels?.length ? liveModels : fallback).includes(model);
 
   return (
     <div className="mesh-bg min-h-screen text-white">
@@ -258,7 +367,7 @@ export default function SettingsPage() {
                   exit={{ opacity: 0 }}
                   className="text-xs text-zinc-500"
                 >
-                   AI model & connection • stored locally
+                   AI model & connection • keys saved on this server
                 </motion.p>
               )}
             </AnimatePresence>
@@ -309,27 +418,71 @@ export default function SettingsPage() {
           animate="show"
           transition={{ delay: 0.15 }}
         >
-          <Label className="mt-6 mb-2 text-[11px] font-semibold tracking-widest text-zinc-500 uppercase">
-            API Key — {PROVIDERS[provider].label}
-          </Label>
+          <div className="mt-6 mb-2 flex items-center gap-2">
+            <Label className="text-[11px] font-semibold tracking-widest text-zinc-500 uppercase">
+              API Key — {PROVIDERS[provider].label}
+            </Label>
+            {vaultFingerprint ? (
+              <Badge className="gap-1 border-emerald-500/30 bg-emerald-500/10 text-[10px] text-emerald-300">
+                <ShieldCheck size={10} /> saved on server
+              </Badge>
+            ) : null}
+          </div>
           <div className="relative">
             <Input
               type={showKey ? "text" : "password"}
-              placeholder="sk-... / sk-ant-..."
-              value={apiKey}
-              onChange={(e) =>
-                patch({ keys: { ...settings.keys, [provider]: e.target.value } })
+              placeholder={
+                vaultFingerprint
+                  ? `key saved on server • sha256:${vaultFingerprint}`
+                  : "sk-... / sk-ant-..."
               }
-              className="dark:bg-white/5 border-white/10 pr-10 text-white placeholder:text-zinc-600"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              className="dark:bg-white/5 border-white/10 pr-24 text-white placeholder:text-zinc-600"
             />
+            <div className="absolute top-1/2 right-3 flex -translate-y-1/2 items-center gap-2">
+              {saveMutation.isPending && <Loader2 size={14} className="animate-spin text-zinc-400" />}
+              {vaultFingerprint && !saveMutation.isPending && (
+                <ShieldCheck size={14} className="text-emerald-400" />
+              )}
               <button
-              onClick={() => setShowKey(!showKey)}
-              className="absolute top-1/2 right-3 -translate-y-1/2 text-zinc-500 hover:text-white"
-               aria-label={showKey ? "Hide key" : "Show key"}
-            >
-              {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
-            </button>
+                onClick={() => setShowKey(!showKey)}
+                className="text-zinc-500 hover:text-white"
+                aria-label={showKey ? "Hide key" : "Show key"}
+              >
+                {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
+              </button>
+            </div>
           </div>
+          {saveMutation.isError && (
+            <p className="mt-1.5 text-[11px] text-red-300">
+              ⚠ {(saveMutation.error as Error)?.message ?? "Failed to save key"}
+            </p>
+          )}
+          {vaultFingerprint ? (
+            <div className="mt-1.5 flex items-start gap-2 text-[11px] text-zinc-500">
+              <span className="flex-1">
+                Tersimpan di server ini — terenkripsi, hanya fingerprint{" "}
+                <span className="font-mono text-zinc-400">sha256:{vaultFingerprint}</span> yang
+                diketahui browser. Ketik key baru untuk mengganti.
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={removeKey}
+                disabled={removeMutation.isPending}
+                className="h-6 shrink-0 gap-1 px-2 text-[11px] text-red-300 hover:text-red-200"
+              >
+                {removeMutation.isPending ? <Loader2 size={11} className="animate-spin" /> : <Trash2 size={11} />}
+                Remove
+              </Button>
+            </div>
+          ) : (
+            <p className="mt-1.5 text-[11px] text-zinc-600">
+              Disimpan di server ini saja (terenkripsi + di-hash) — key tidak pernah
+              dikirim balik ke browser.
+            </p>
+          )}
         </motion.div>
 
         {/* base url */}
@@ -366,7 +519,7 @@ export default function SettingsPage() {
             <Label className="text-[11px] font-semibold tracking-widest text-zinc-500 uppercase">
               Model
             </Label>
-            {modelsLoading && <Loader2 size={12} className="animate-spin text-zinc-400" />}
+            {modelsQuery.isFetching && <Loader2 size={12} className="animate-spin text-zinc-400" />}
             {liveModels?.length ? (
                  <Badge>{liveModels.length} live from API</Badge>
             ) : (
@@ -377,34 +530,60 @@ export default function SettingsPage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => loadModels(true)}
-              disabled={modelsLoading || !apiKey.trim()}
+              onClick={refreshModels}
+              disabled={modelsQuery.isFetching || !hasKey}
               className="ml-auto h-7 text-[11px]"
             >
                <RefreshCw size={12} /> Refresh
             </Button>
           </div>
+          {options.length > 15 && (
+            <Input
+              value={modelFilter}
+              onChange={(e) => setModelFilter(e.target.value)}
+              placeholder={`Filter ${options.length} models…`}
+              className="mb-2 h-9 border-white/10 bg-white/5 text-xs text-white placeholder:text-zinc-600"
+            />
+          )}
           <Select value={model} onValueChange={(v) => patch({ model: v })}>
            <SelectTrigger className="dark:bg-white/5 border-white/10 w-full py-5 text-white">
                <SelectValue placeholder="Choose a model" />
             </SelectTrigger>
             <SelectContent>
-              {options.map((m) => (
+              {visibleOptions.map((m) => (
                 <SelectItem key={m} value={m}>
                   {m}
                 </SelectItem>
               ))}
+              {!visibleOptions.length && (
+                <p className="px-2 py-3 text-xs text-zinc-500">No match — type the ID below.</p>
+              )}
             </SelectContent>
           </Select>
+          <div className="mt-2 flex items-center gap-2">
+            <Input
+              value={model}
+              onChange={(e) => patch({ model: e.target.value })}
+              placeholder="Or type any model ID (e.g. my-gateway/custom-model)"
+              spellCheck={false}
+              autoComplete="off"
+              className="h-9 flex-1 border-white/10 bg-white/5 font-mono text-xs text-white placeholder:text-zinc-600"
+            />
+            {isCustomModel && (
+              <Badge variant="outline" className="shrink-0 text-[10px] text-amber-200">
+                custom
+              </Badge>
+            )}
+          </div>
           {modelsError ? (
              <p className="mt-1.5 text-[11px] text-zinc-400">⚠ {modelsError} — using the default list.</p>
-          ) : !apiKey.trim() ? (
+          ) : !hasKey ? (
             <p className="mt-1.5 text-[11px] text-zinc-600">
                Enter an API key to load the live model list from the API.
             </p>
           ) : null}
           <p className="mt-1.5 text-[11px] text-zinc-600">
-             The key is stored only in this browser&apos;s localStorage.
+             The key lives on this server (encrypted); this browser only keeps a marker.
           </p>
         </motion.div>
 
@@ -483,7 +662,7 @@ export default function SettingsPage() {
                     key={test.url}
                     initial={{ opacity: 0, y: 12 }}
                     animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0 }}
+                    exit={{ opacity: 0, y: -12 }}
                     className="mt-3 overflow-hidden rounded-xl border border-white/10"
                   >
                     <p className="truncate border-b border-white/10 bg-black px-3 py-2 text-[11px] text-zinc-400">

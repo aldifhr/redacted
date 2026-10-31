@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { createHash, timingSafeEqual } from "node:crypto";
 
 // Server-only: opt-in bearer auth, enforced by guardApi.
 // - APP_TOKEN unset (default local use) → open, no friction.
@@ -10,12 +11,10 @@ export function requireAuth(req: Request): NextResponse | null {
   if (!token) return null;
   const header = req.headers.get("authorization") ?? "";
   const presented = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (presented && presented.length === token.length) {
-    let diff = 0;
-    for (let i = 0; i < token.length; i++) {
-      diff |= token.charCodeAt(i) ^ presented.charCodeAt(i);
-    }
-    if (diff === 0) return null;
-  }
+  // Hash both sides so comparison is constant-time and never leaks the
+  // configured token's length.
+  const expected = createHash("sha256").update(token).digest();
+  const actual = createHash("sha256").update(presented).digest();
+  if (timingSafeEqual(expected, actual)) return null;
   return NextResponse.json({ error: "unauthorized" }, { status: 401 });
 }

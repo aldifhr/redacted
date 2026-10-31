@@ -1,5 +1,5 @@
 {
-  "runId": "3040a177a2a9411c94b479fde2531cca",
+  "runId": "da856021b5ce475fa666d74c619f3631",
   "site": "https://www.saucedemo.com",
   "areas": [
     "login",
@@ -16,6 +16,6 @@
   "completedAreas": [],
   "currentArea": "login",
   "nextArea": "products",
-  "lastAction": "browser_screenshot",
-  "updatedAt": 1790315384584
+  "lastAction": "browser_scroll",
+  "updatedAt": 1793415231578
 }

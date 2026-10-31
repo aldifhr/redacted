@@ -86,7 +86,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         variant: input.variant ?? "info",
         duration: input.duration ?? 4000,
       };
-      setToasts((prev) => [...prev.slice(-3), item]);
+      setToasts((prev) => {
+        const next = [...prev, item].slice(-4);
+        const kept = new Set(next.map((t) => t.id));
+        // Evicted toasts must not keep a live timer that fires later.
+        for (const [id, timer] of timers.current) {
+          if (!kept.has(id)) {
+            clearTimeout(timer);
+            timers.current.delete(id);
+          }
+        }
+        return next;
+      });
       if (item.duration > 0) {
         const timer = setTimeout(() => dismiss(id), item.duration);
         timers.current.set(id, timer);
@@ -210,6 +221,8 @@ function Toaster({
       .querySelector(`[data-toast-id="${id}"]`)
       ?.classList.remove("is-open");
     const closeMs = cssMs("--toast-close", 250);
+    const existing = timers.current.get(id);
+    if (existing) clearTimeout(existing);
     const timer = setTimeout(() => {
       timers.current.delete(id);
       setLeaving((prev) => {

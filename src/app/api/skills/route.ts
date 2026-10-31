@@ -23,7 +23,7 @@ export async function POST(request: Request) {
   const blocked = guardApi(request, { scope: "skills" });
   if (blocked) return blocked;
   const parsed = z.object({
-    action: z.enum(["remove", "disable", "enable"]).optional(),
+    action: z.enum(["install", "remove", "disable", "enable"]).optional(),
     id: z.string().min(1).max(200),
   }).safeParse(await request.json().catch(() => ({})));
   if (!parsed.success) {

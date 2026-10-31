@@ -2,6 +2,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import ReactMarkdown from "react-markdown";
@@ -17,6 +18,7 @@ import {
   FileSpreadsheet,
   FlaskConical,
   Loader2,
+  MonitorPlay,
   ScrollText,
   Copy,
   Pencil,
@@ -40,7 +42,8 @@ import {
 } from "@/lib/store";
 import { useToast } from "@/components/ui/toast";
 import { useAppStore } from "@/lib/app-store";
-import { abortRun, trackRun, untrackRun } from "@/lib/chat-runs";
+import { abortRun, hasRun, trackRun, untrackRun } from "@/lib/chat-runs";
+import { estimateCost, fmtTokens } from "@/lib/cost";
 import { now, type Approval, type Attachment, type LightboxState, type Msg, type ThinkingEntry } from "@/components/chat/types";
 import { PROGRESS_LABELS, PROVIDER_META, SUGGESTIONS, TOOL_META } from "@/components/chat/meta";
 import { COMMANDS, HELP_TEXT, parseCommand } from "@/components/chat/commands";
@@ -50,10 +53,57 @@ import Sidebar from "@/components/chat/Sidebar";
 import Composer from "@/components/chat/Composer";
 import SearchModal from "@/components/chat/SearchModal";
 import Lightbox from "@/components/chat/Lightbox";
+import LiveView from "@/components/chat/LiveView";
 import ApprovalCard from "@/components/chat/ApprovalCard";
 import ThinkingList from "@/components/chat/ThinkingList";
 import Stagger from "@/components/chat/Stagger";
 import MatrixLoader from "@/components/chat/MatrixLoader";
+
+const COMMITTED_KEY = "chat-committed-runs";
+function isRunCommitted(runId: string) {
+  try {
+    const ids = JSON.parse(localStorage.getItem(COMMITTED_KEY) ?? "[]") as unknown;
+    return Array.isArray(ids) && ids.includes(runId);
+  } catch {
+    return false;
+  }
+}
+function markRunCommitted(runId: string) {
+  try {
+    const ids = JSON.parse(localStorage.getItem(COMMITTED_KEY) ?? "[]") as unknown;
+    const list = Array.isArray(ids) ? (ids.filter((x): x is string => typeof x === "string")) : [];
+    if (!list.includes(runId)) list.push(runId);
+    localStorage.setItem(COMMITTED_KEY, JSON.stringify(list.slice(-100)));
+  } catch {}
+}
+
+type DoneData = {
+  text?: string;
+  toolCalls?: { tool: string; input: unknown }[];
+  screenshots?: { url: string; image: string }[];
+  artifacts?: { kind: string; file: string; meta: Record<string, unknown> }[];
+  browserActions?: number;
+  artifactActions?: number;
+  modelRounds?: number;
+  requestedAreas?: string[];
+  completedAreas?: string[];
+  coverage?: { requestedAreas: string[]; visitedAreas: string[]; coveredAreas: string[]; missingAreas: string[] };
+  stopReason?: Msg["stopReason"];
+  skills?: string[];
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  model?: string;
+};
+type Replay = {
+  meta?: { status?: string };
+  events?: { type: string; data?: Record<string, unknown> }[];
+};
+
+// Tool yang berarti agent benar-benar membuka/memakai browser. browser_bash
+// dan browser_read_file read-only di sisi host, tidak membuka halaman —
+// live view tidak perlu nongol untuk keduanya.
+function isBrowserTool(tool: string): boolean {
+  return tool.startsWith("browser_") && tool !== "browser_bash" && tool !== "browser_read_file";
+}
 
 export default function Chat({ sessionId: lockedSessionId }: { sessionId?: string }) {
   const router = useRouter();
@@ -66,6 +116,7 @@ export default function Chat({ sessionId: lockedSessionId }: { sessionId?: strin
   const setRunning = useAppStore((state) => state.setRunning);
   const setPendingApproval = useAppStore((state) => state.setPendingApproval);
   const runningIds = useAppStore((state) => state.runningIds);
+  const pendingApprovals = useAppStore((state) => state.pendingApprovals);
   const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -74,6 +125,8 @@ export default function Chat({ sessionId: lockedSessionId }: { sessionId?: strin
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [lightbox, setLightbox] = useState<LightboxState>(null);
+  const [liveOpen, setLiveOpen] = useState(false);
+  const [liveRunId, setLiveRunId] = useState<string | undefined>(undefined);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -106,7 +159,11 @@ export default function Chat({ sessionId: lockedSessionId }: { sessionId?: strin
   const streamRef = useRef<AbortController | null>(null);
   const thinkingHistoryRef = useRef<ThinkingEntry[]>([]);
   const runIdRef = useRef<string | null>(null);
-  const { error: showError, success: showSuccess } = useToast();
+  const resumedRef = useRef<Set<string>>(new Set());
+  // Run yang live view-nya sudah pernah otomatis terbuka (sekali per run).
+  const autoLiveRef = useRef<string | null>(null);
+  const [liveUsage, setLiveUsage] = useState<{ inputTokens: number; outputTokens: number } | null>(null);
+  const { error: showError, success: showSuccess, info: showInfo } = useToast();
 
   async function stopRun(sessionId?: string) {
     // Guard against React passing the click event when wired as onClick={stopRun}.
@@ -182,7 +239,142 @@ export default function Chat({ sessionId: lockedSessionId }: { sessionId?: strin
     }
   }, []);
 
-  // settings + sessions dari localStorage — dibaca deferred setelah mount
+  // Resume a durable server run after a reload: poll its .runs JSONL and
+  // commit the final answer once the run ends.
+  async function resumeRun(sid: string, rid: string) {
+    if (resumedRef.current.has(rid)) return;
+    resumedRef.current.add(rid);
+    const showUi = () => useAppStore.getState().activeId === sid;
+    if (showUi()) {
+      setLoading(true);
+      setStatusText("Reconnecting to run…");
+      setProgressStage(2);
+    }
+    try {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const res = await fetch(`/api/chat/runs/${encodeURIComponent(rid)}`);
+        if (res.status === 404) {
+          setRunning(sid, null);
+          return;
+        }
+        if (!res.ok) throw new Error(`run replay failed (${res.status})`);
+        const data = (await res.json()) as Replay;
+        const events = data.events ?? [];
+        // Run yang sudah membuka browser sebelum reload: live view nongol
+        // lagi begitu reconnect (sekali per run).
+        if (
+          showUi() &&
+          events.some(
+            (e) =>
+              e.type === "status" &&
+              isBrowserTool(String((e.data as { tool?: string } | undefined)?.tool ?? ""))
+          ) &&
+          autoLiveRef.current !== rid
+        ) {
+          autoLiveRef.current = rid;
+          setLiveRunId(rid);
+          setLiveOpen(true);
+        }
+        const lastStatus = [...events].reverse().find((e) => e.type === "status");
+        const lastLabel = lastStatus?.data?.label;
+        if (showUi() && typeof lastLabel === "string") setStatusText(lastLabel);
+        const done = [...events].reverse().find((e) => e.type === "done");
+        if (done) {
+          const d = (done.data ?? {}) as DoneData;
+          const base = useAppStore.getState().sessions.find((s) => s.id === sid)?.messages ?? [];
+          commitMessages(sid, [
+            ...base,
+            {
+              role: "assistant",
+              content: d.text || "(no response)",
+              toolCalls: d.toolCalls,
+              screenshots: d.screenshots,
+              artifacts: d.artifacts,
+              browserActions: d.browserActions,
+              artifactActions: d.artifactActions,
+              modelRounds: d.modelRounds,
+              requestedAreas: d.requestedAreas,
+              completedAreas: d.completedAreas,
+              coverage: d.coverage,
+              stopReason: d.stopReason,
+              skills: d.skills,
+              usage: d.usage,
+              model: d.model ?? model,
+              time: now(),
+            },
+          ]);
+          markRunCommitted(rid);
+          setRunning(sid, null);
+          setPendingApproval(sid, null);
+          if (showUi()) {
+            setProgressStage(4);
+            showSuccess("Run finished", "The background run completed and its result was added here.");
+          }
+          return;
+        }
+        const end = [...events].reverse().find((e) => e.type === "aborted" || e.type === "error");
+        if (end) {
+          setRunning(sid, null);
+          setPendingApproval(sid, null);
+          if (showUi()) {
+            setError(
+              end.type === "error"
+                ? String(end.data?.error ?? "Run failed.")
+                : "Run was stopped before it finished."
+            );
+          }
+          markRunCommitted(rid);
+          return;
+        }
+        if (data.meta?.status && data.meta.status !== "running") {
+          setRunning(sid, null);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    } catch (e) {
+      if (showUi()) showError("Reconnect failed", e instanceof Error ? e.message : "Unknown error");
+      setRunning(sid, null);
+    } finally {
+      if (showUi()) setLoading(false);
+    }
+  }
+
+  // On mount, reattach to runs the server is still executing and import
+  // results that finished while the page was closed.
+  useEffect(() => {
+    if (!hydrated) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/chat/runs");
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          runs?: { runId: string; sessionId: string; status: string; startedAt: number; finishedAt?: number }[];
+        };
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        for (const run of data.runs ?? []) {
+          if (!run.sessionId || !store.sessions.some((s) => s.id === run.sessionId)) continue;
+          if (isRunCommitted(run.runId)) continue;
+          if (run.status === "running") {
+            setRunning(run.sessionId, run.runId);
+            void resumeRun(run.sessionId, run.runId);
+          } else if (Date.now() - (run.finishedAt ?? run.startedAt) < 60 * 60 * 1000) {
+            void resumeRun(run.sessionId, run.runId);
+          }
+        }
+      } catch {}
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // resumeRun is stable for the life of the mount; re-running this effect on
+    // every session edit would refetch the same run list repeatedly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated]);
+
+
   // agar render pertama identik dengan SSR (tanpa hydration mismatch)
   useEffect(() => {
     const t = setTimeout(() => {
@@ -229,6 +421,18 @@ export default function Chat({ sessionId: lockedSessionId }: { sessionId?: strin
   const model = settings.model;
   const apiKey = settings.keys[provider] ?? "";
   const baseUrl = settings.baseUrls[provider] ?? "";
+  // Key bisa tinggal di vault server (bukan di browser ini) — cek ke server
+  // supaya badge status tidak salah bilang "No setup".
+  const keysQuery = useQuery({
+    queryKey: ["keys"],
+    queryFn: async (): Promise<{ provider: string }[]> => {
+      const r = await fetch("/api/keys");
+      const d = await r.json();
+      return Array.isArray(d.keys) ? (d.keys as { provider: string }[]) : [];
+    },
+    staleTime: 60_000,
+  });
+  const hasServerKey = (keysQuery.data ?? []).some((k) => k.provider === provider);
 
   useEffect(() => {
     if (!hydrated || !activeId) return;
@@ -370,7 +574,7 @@ export default function Chat({ sessionId: lockedSessionId }: { sessionId?: strin
 
   async function rememberRun(userContent: string, assistantContent: string, key: number) {
     const apiKey = settings.keys[settings.provider] ?? "";
-    if (!apiKey.trim()) {
+    if (!apiKey.trim() && !hasServerKey) {
       showError("API key missing", "Add an API key in /settings first.");
       return;
     }
@@ -438,12 +642,24 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
       if (parsed.name === "help" || !def) {
         // Answered locally — no LLM call.
         const targetId = activeId;
-        if (!targetId) return;
-        commitMessages(targetId, [
-          ...messages,
-          { role: "user", content: draft, time: now() },
-          { role: "assistant", content: HELP_TEXT, model, time: now() },
-        ], draft);
+        if (targetId) {
+          commitMessages(targetId, [
+            ...messages,
+            { role: "user", content: draft, time: now() },
+            { role: "assistant", content: HELP_TEXT, model, time: now() },
+          ], draft);
+        } else {
+          const n = newSession();
+          const list = [n, ...sessions];
+          setSessions(list);
+          saveSessions(list);
+          setActiveId(n.id);
+          saveActiveId(n.id);
+          commitMessages(n.id, [
+            { role: "user", content: draft, time: now() },
+            { role: "assistant", content: HELP_TEXT, model, time: now() },
+          ], draft);
+        }
         setInput("");
         if (taRef.current) taRef.current.style.height = "auto";
         return;
@@ -495,6 +711,7 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
     thinkingHistoryRef.current = [];
     setThinkingOpen(true);
     setProgressStage(1);
+    setLiveUsage(null);
     requestAnimationFrame(() => {
       if (autoScrollRef.current) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     });
@@ -518,6 +735,7 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
           model,
           apiKey,
           baseUrl,
+          sessionId: targetId,
         }),
       });
       if (!res.ok || !res.body) {
@@ -539,7 +757,7 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
         requestedAreas?: string[];
         completedAreas?: string[];
         coverage?: { requestedAreas: string[]; visitedAreas: string[]; coveredAreas: string[]; missingAreas: string[] };
-        stopReason?: "completed" | "action_limit" | "model_timeout" | "model_round_limit";
+        stopReason?: Msg["stopReason"];
         skills?: string[];
         usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
       } | null = null;
@@ -561,9 +779,23 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
               if (rid) setRunning(targetId, rid);
             } catch {}
           } else if (ev === "status") {
-            if (sessionRef.current !== sess) return;
+            // Keep reading a background run after a session switch: its
+            // result is committed to targetId below, not to the active view.
+            if (sessionRef.current !== sess) continue;
             try {
-              const d = JSON.parse(dm) as { label?: string; thinking?: string; phase?: string; agent?: "main" | "sub" };
+              const d = JSON.parse(dm) as { label?: string; thinking?: string; phase?: string; agent?: "main" | "sub"; tool?: string };
+              // Live preview nongol ketika agent emang membuka browser (tool
+              // browser_* pertama) — bukan saat run dimulai. Sekali per run.
+              if (
+                d.tool &&
+                isBrowserTool(d.tool) &&
+                runIdRef.current &&
+                autoLiveRef.current !== runIdRef.current
+              ) {
+                autoLiveRef.current = runIdRef.current;
+                setLiveRunId(runIdRef.current);
+                setLiveOpen(true);
+              }
               if (d.label) {
                 setStatusText(d.label);
                 setAgentMode(d.agent ?? (/sub-agent|delegate|delegat/i.test(d.label) ? "sub" : "main"));
@@ -594,6 +826,15 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
                 });
               }
             } catch {}
+          } else if (ev === "usage") {
+            if (sessionRef.current !== sess) continue;
+            try {
+              const u = JSON.parse(dm) as { inputTokens?: number; outputTokens?: number };
+              setLiveUsage({
+                inputTokens: u.inputTokens ?? 0,
+                outputTokens: u.outputTokens ?? 0,
+              });
+            } catch {}
           } else if (ev === "done") {
             const completed = JSON.parse(dm) as {
               text: string;
@@ -606,7 +847,7 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
               requestedAreas?: string[];
               completedAreas?: string[];
               coverage?: { requestedAreas: string[]; visitedAreas: string[]; coveredAreas: string[]; missingAreas: string[] };
-              stopReason?: "completed" | "action_limit" | "model_timeout" | "model_round_limit";
+              stopReason?: Msg["stopReason"];
               skills?: string[];
               usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
             };
@@ -622,15 +863,27 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
             aborted = true;
             break;
           } else if (ev === "approval") {
-            if (sessionRef.current !== sess) continue;
             try {
               const d = JSON.parse(dm) as { id?: string; runId?: string; tool?: string; input?: unknown };
               if (d.id && d.runId) {
-                setApproval({ id: d.id, runId: d.runId, tool: d.tool ?? "tool", input: d.input });
                 setPendingApproval(targetId, { runId: d.runId, id: d.id });
-                requestAnimationFrame(() => {
-                  if (autoScrollRef.current) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-                });
+                if (sessionRef.current === sess) {
+                  setApproval({ id: d.id, runId: d.runId, tool: d.tool ?? "tool", input: d.input });
+                  requestAnimationFrame(() => {
+                    if (autoScrollRef.current) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+                  });
+                } else {
+                  // Background run needs a human decision: notify, and jump
+                  // there only when the user is not looking at the app.
+                  const title = useAppStore.getState().sessions.find((s) => s.id === targetId)?.title;
+                  showInfo(
+                    "Approval needed",
+                    `${title ?? "A background chat"} wants to run ${d.tool ?? "a tool"}.`
+                  );
+                  if (typeof document !== "undefined" && (document.hidden || !document.hasFocus())) {
+                    openChat(targetId);
+                  }
+                }
               }
             } catch {}
           } else if (ev === "error") {
@@ -694,10 +947,12 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
       setRunning(targetId, null);
       setPendingApproval(targetId, null);
       if (streamRef.current === ctrl) streamRef.current = null;
+      if (runIdRef.current) markRunCommitted(runIdRef.current);
       runIdRef.current = null;
       if (sessionRef.current === sess) setLoading(false);
       if (sessionRef.current === sess) setStopping(false);
       if (sessionRef.current === sess) setApproval(null);
+      if (sessionRef.current === sess) setLiveUsage(null);
       requestAnimationFrame(() => {
         if (autoScrollRef.current) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
       });
@@ -753,7 +1008,27 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
   }
 
   const PIcon = PROVIDER_META[provider].icon;
-  const isConfigured = Boolean(apiKey.trim() && baseUrl.trim());
+  // baseUrl may be blank ("use the default"), so only the key gates setup.
+  const isConfigured = Boolean(apiKey.trim()) || hasServerKey;
+  const usageTotals = messages.reduce(
+    (acc, m) => {
+      if (m.usage) {
+        acc.inputTokens += m.usage.inputTokens ?? 0;
+        acc.outputTokens += m.usage.outputTokens ?? 0;
+      }
+      return acc;
+    },
+    { inputTokens: 0, outputTokens: 0 }
+  );
+  if (loading && liveUsage) {
+    usageTotals.inputTokens += liveUsage.inputTokens;
+    usageTotals.outputTokens += liveUsage.outputTokens;
+  }
+  const totalTokens = usageTotals.inputTokens + usageTotals.outputTokens;
+  const runCost = estimateCost(model, usageTotals.inputTokens, usageTotals.outputTokens);
+  const activeRunId = activeId ? runningIds[activeId] : undefined;
+  const reconnecting =
+    !!activeRunId && !hasRun(activeId ?? "") && !loading && !resumedRef.current.has(activeRunId);
 
   return (
     <div className="mesh-bg flex h-screen text-white">
@@ -767,6 +1042,7 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
         sessions={visibleSessions}
         activeId={activeId}
         runningIds={runningIds}
+        pendingApprovals={pendingApprovals}
         onClose={() => setSidebarOpen(false)}
         onNewChat={newChat}
         onSwitchSession={openChat}
@@ -805,6 +1081,43 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
             <SettingsIcon size={13} className="text-zinc-500" />
           </Link>
           <div className="ml-auto flex items-center gap-2">
+            {activeRunId && (
+              <button
+                onClick={() => {
+                  setLiveRunId(activeRunId);
+                  setLiveOpen(true);
+                }}
+                title="Watch the agent's browser live"
+                className="inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-3 py-1.5 text-[10px] font-semibold text-white transition hover:bg-white/20"
+              >
+                <MonitorPlay size={11} /> Live
+              </button>
+            )}
+            {reconnecting && activeId && (
+              <button
+                onClick={() => {
+                  const rid = runningIds[activeId];
+                  if (rid) void resumeRun(activeId, rid);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-3 py-1.5 text-[10px] font-semibold text-white transition hover:bg-white/20"
+              >
+                <Loader2 size={11} className="animate-spin" /> Reconnect
+              </button>
+            )}
+            {totalTokens > 0 && (
+              <span
+                title={`${usageTotals.inputTokens.toLocaleString()} input + ${usageTotals.outputTokens.toLocaleString()} output tokens${runCost !== null ? ` · est. $${runCost.toFixed(4)}` : ""}`}
+                className="hidden items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-[10px] text-zinc-400 sm:flex"
+              >
+                <Zap size={11} />
+                {fmtTokens(totalTokens)} tok
+                {runCost !== null && (
+                  <span className="text-zinc-500">
+                    · ~${runCost < 0.01 ? "<0.01" : runCost.toFixed(2)}
+                  </span>
+                )}
+              </span>
+            )}
             <Link
               href="/settings"
               title={
@@ -1297,6 +1610,9 @@ function splitFiles(content: string): { text: string; files: { name: string; bod
           onClose={() => setLightbox(null)}
           onStep={(i) => setLightbox({ ...lightbox, i })}
         />
+      )}
+      {liveOpen && (
+        <LiveView runId={liveRunId} onClose={() => setLiveOpen(false)} />
       )}
     </div>
   );

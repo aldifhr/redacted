@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
 import { ArrowLeft, Brain, Loader2, Plus, Sparkles, Trash2 } from "lucide-react";
@@ -8,40 +9,28 @@ import { useToast } from "@/components/ui/toast";
 import { loadSessions, loadSettings } from "@/lib/store";
 
 export default function MemoryPage() {
-  const [facts, setFacts] = useState<string[]>([]);
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [consolidating, setConsolidating] = useState(false);
   const { success, error: showError } = useToast();
+  const queryClient = useQueryClient();
 
-  async function refresh() {
-    try {
+  const factsQuery = useQuery({
+    queryKey: ["memory"],
+    queryFn: async (): Promise<string[]> => {
       const r = await fetch("/api/memory");
       const d = await r.json();
-      if (Array.isArray(d.facts)) setFacts(d.facts);
-    } catch {}
-  }
+      return Array.isArray(d.facts) ? (d.facts as string[]) : [];
+    },
+    // MEMORY.md bisa berubah dari tab/sesi lain — polling 5s seperti sebelumnya.
+    refetchInterval: 5_000,
+  });
+  const facts = factsQuery.data ?? [];
 
-  useEffect(() => {
-    const t = setTimeout(() => {
-      refresh();
-    }, 0);
-    const iv = setInterval(() => {
-      refresh();
-    }, 5000);
-    window.addEventListener("focus", refresh);
-    return () => {
-      clearTimeout(t);
-      clearInterval(iv);
-      window.removeEventListener("focus", refresh);
-    };
-  }, []);
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: ["memory"] });
+  };
 
-  async function save() {
-    const fact = input.trim();
-    if (!fact || busy) return;
-    setBusy(true);
-    try {
+  const saveMutation = useMutation({
+    mutationFn: async (fact: string) => {
       const r = await fetch("/api/memory", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -49,26 +38,27 @@ export default function MemoryPage() {
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Failed to save");
+    },
+    onSuccess: (_data, fact) => {
       setInput("");
       success("Fact saved", fact.slice(0, 40));
-      refresh();
-    } catch (e) {
+      invalidate();
+    },
+    onError: (e) => {
       showError("Error", e instanceof Error ? e.message : "Failed to save");
-    } finally {
-      setBusy(false);
-    }
-  }
+    },
+  });
 
-  async function consolidate() {
-    setConsolidating(true);
-    try {
+  const consolidateMutation = useMutation({
+    mutationFn: async () => {
       const settings = loadSettings();
       const apiKey = settings.keys[settings.provider] ?? "";
       if (!apiKey.trim()) throw new Error("Add an API key in /settings first");
       const messages = loadSessions()
-        .flatMap((s) => s.messages)
+        .flatMap((s) => [...s.messages].reverse())
         .filter((m) => m.content.trim())
-        .slice(-30)
+        .slice(0, 30)
+        .reverse()
         .map((m) => ({
           role: m.role,
           content: m.content.split("\n\nAttached files:\n")[0].slice(0, 2000),
@@ -87,21 +77,24 @@ export default function MemoryPage() {
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Consolidation failed");
-      const saved = (d.saved ?? []).length;
+      return (d.saved ?? []) as unknown[];
+    },
+    onSuccess: (saved) => {
       success(
         "Memory consolidated",
-        saved ? `${saved} new fact(s) saved` : "Nothing new worth remembering"
+        saved.length ? `${saved.length} new fact(s) saved` : "Nothing new worth remembering"
       );
-      refresh();
-    } catch (e) {
+      invalidate();
+    },
+    onError: (e) => {
       showError("Error", e instanceof Error ? e.message : "Consolidation failed");
-    } finally {
-      setConsolidating(false);
-    }
-  }
-  async function forget(fact: string) {
-    const query = fact.split(" ").slice(0, 4).join(" ");
-    try {
+    },
+  });
+
+  const forgetMutation = useMutation({
+    // Send the whole fact so the server removes exactly this line; a 4-word
+    // prefix could delete several unrelated facts that share those words.
+    mutationFn: async (query: string) => {
       const r = await fetch("/api/memory", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -109,11 +102,28 @@ export default function MemoryPage() {
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Failed to delete");
+    },
+    onSuccess: () => {
       success("Fact deleted", "Memory updated");
-      refresh();
-    } catch (e) {
+      invalidate();
+    },
+    onError: (e) => {
       showError("Error", e instanceof Error ? e.message : "Failed to delete");
-    }
+    },
+  });
+
+  function save() {
+    const fact = input.trim();
+    if (!fact || saveMutation.isPending) return;
+    saveMutation.mutate(fact);
+  }
+
+  function consolidate() {
+    consolidateMutation.mutate();
+  }
+
+  function forget(fact: string) {
+    forgetMutation.mutate(fact.trim());
   }
 
   return (
@@ -147,12 +157,12 @@ export default function MemoryPage() {
           </div>
           <button
             onClick={consolidate}
-            disabled={consolidating}
+            disabled={consolidateMutation.isPending}
             title="Extract durable facts from recent chats"
             className="ml-auto inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-white px-3 py-2 text-xs font-bold text-black transition hover:bg-zinc-200 active:scale-[0.98] disabled:opacity-30"
           >
-            {consolidating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
-            {consolidating ? "Reading…" : "Consolidate"}
+            {consolidateMutation.isPending ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+            {consolidateMutation.isPending ? "Reading…" : "Consolidate"}
           </button>
         </motion.div>
 
@@ -173,10 +183,10 @@ export default function MemoryPage() {
             className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-sm text-white outline-none placeholder:text-zinc-600 focus:border-white/40"
           />
           <button
-            disabled={busy || !input.trim()}
+            disabled={saveMutation.isPending || !input.trim()}
             className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-white text-black hover:bg-zinc-200 disabled:opacity-30"
           >
-            {busy ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />}
+            {saveMutation.isPending ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />}
           </button>
         </motion.form>
 

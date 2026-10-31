@@ -1,7 +1,7 @@
 "use client";
 
 import { create } from "zustand";
-import { Session, Settings, defaultSettings } from "./store";
+import { Session, Settings, defaultSettings, saveSettings } from "./store";
 
 type AppState = {
   settings: Settings;
@@ -26,7 +26,12 @@ export const useAppStore = create<AppState>((set) => ({
   activeId: null,
   runningIds: {},
   pendingApprovals: {},
-  setSettings: (settings) => set({ settings }),
+  // Satu sumber kebenaran: setiap perubahan settings langsung ditulis ke
+  // localStorage, jadi /chat dan halaman lain tidak perlu reload.
+  setSettings: (settings) => {
+    saveSettings(settings);
+    set({ settings });
+  },
   setSessions: (sessions) =>
     set((state) => ({
       sessions: typeof sessions === "function" ? sessions(state.sessions) : sessions,

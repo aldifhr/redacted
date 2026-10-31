@@ -31,7 +31,7 @@ export default function SkillsPage() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
-  const load = useCallback(async (search = query) => {
+  const load = useCallback(async (search: string) => {
     try {
       const response = await fetch(`/api/skills?q=${encodeURIComponent(search)}`, { cache: "no-store" });
       const data = await response.json();
@@ -42,7 +42,7 @@ export default function SkillsPage() {
     } catch (value) {
       setError(value instanceof Error ? value.message : "Failed to load skills");
     }
-  }, [query]);
+  }, []);
 
   useEffect(() => {
     const timer = setTimeout(() => { void load(""); }, 0);
@@ -56,7 +56,7 @@ export default function SkillsPage() {
       const response = await fetch("/api/skills", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: isInstalled ? "remove" : "install", id: skill.id }) });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Skill operation failed");
-      await load();
+      await load(query);
     } catch (value) {
       setError(value instanceof Error ? value.message : "Skill operation failed");
     } finally {
@@ -70,7 +70,7 @@ export default function SkillsPage() {
       const response = await fetch("/api/skills", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: disabled ? "disable" : "enable", id }) });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Skill operation failed");
-      await load();
+      await load(query);
     } catch (value) {
       setError(value instanceof Error ? value.message : "Skill operation failed");
     } finally {
@@ -81,7 +81,7 @@ export default function SkillsPage() {
   return <main className="mesh-bg min-h-screen text-white"><div className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6">
     <Link href="/chat" className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-300 hover:bg-white/10 hover:text-white"><ArrowLeft size={15} /> Back to chat</Link>
     <header className="mt-8 flex items-start gap-3"><div className="grid h-11 w-11 place-items-center rounded-2xl bg-white text-black"><Sparkles size={22} /></div><div><h1 className="text-2xl font-bold tracking-tight">Agent Skills</h1><p className="mt-1 text-sm text-zinc-500">Discover procedural knowledge from skills.sh and make it available to FarayAgent.</p></div></header>
-    <form onSubmit={(event) => { event.preventDefault(); void load(); }} className="mt-6 flex gap-2"><div className="relative flex-1"><Search size={16} className="absolute top-1/2 left-3 -translate-y-1/2 text-zinc-600" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search skills…" className="w-full rounded-xl border border-white/10 bg-white/5 py-3 pr-3 pl-9 text-sm text-white outline-none placeholder:text-zinc-600 focus:border-white/30" /></div><button className="rounded-xl bg-white px-4 text-sm font-semibold text-black hover:bg-zinc-200">Search</button></form>
+    <form onSubmit={(event) => { event.preventDefault(); void load(query); }} className="mt-6 flex gap-2"><div className="relative flex-1"><Search size={16} className="absolute top-1/2 left-3 -translate-y-1/2 text-zinc-600" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search skills…" className="w-full rounded-xl border border-white/10 bg-white/5 py-3 pr-3 pl-9 text-sm text-white outline-none placeholder:text-zinc-600 focus:border-white/30" /></div><button className="rounded-xl bg-white px-4 text-sm font-semibold text-black hover:bg-zinc-200">Search</button></form>
     {error && <p className="mt-4 rounded-xl border border-amber-300/20 bg-amber-300/5 px-4 py-3 text-sm text-amber-200">{error}</p>}
     {installed.length > 0 && (
       <section className="mt-8">

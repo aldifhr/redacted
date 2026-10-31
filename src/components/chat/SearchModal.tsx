@@ -57,9 +57,10 @@ export default function SearchModal({ sessions, searchQuery, setSearchQuery, onC
           <button onClick={requestClose} className="text-zinc-500 hover:text-white"><X size={16} /></button>
         </div>
         <div className="mt-3 max-h-72 overflow-y-auto">
-          {sessions.flatMap((s) => s.messages.map((m) => ({ session: s, message: m } as { session: Session; message: Msg })))
+          {sessions
+            .flatMap((s) => [...s.messages].reverse().map((m) => ({ session: s, message: m } as { session: Session; message: Msg })))
             .filter(({ message }) => !searchQuery.trim() || message.content.toLowerCase().includes(searchQuery.toLowerCase()))
-            .slice(-30).reverse().map(({ session, message }, i) => (
+            .slice(0, 30).map(({ session, message }, i) => (
               <button key={`${session.id}-${i}`} onClick={() => onPick(session.id)} className="block w-full rounded-xl px-3 py-2 text-left hover:bg-white/10">
                 <span className="text-[10px] text-zinc-500">{session.title}</span>
                 <span className="mt-0.5 block truncate text-sm text-zinc-200">{message.content}</span>

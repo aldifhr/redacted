@@ -10,7 +10,7 @@ import Stagger from "@/components/chat/Stagger";
 
 type SpecInfo = { file: string; kb: number; updatedAt: number };
 type SpecResult = { title: string; file: string; status: string; durationMs: number; error: string };
-type RunSummary = { ok: boolean; passed: number; failed: number; skipped: number; durationMs: number; results: SpecResult[]; error?: string };
+type RunSummary = { ok: boolean; passed: number; failed: number; skipped: number; durationMs: number; results: SpecResult[]; error?: string; lastFailed?: boolean; artifacts?: { kind: string; name: string; path: string }[] };
 type RunLogEntry = { id: string; at: number; scope: string | null; passed: number; failed: number; skipped: number; durationMs: number; ok: boolean };
 type TestCase = { id: string; area: string; type: string; title: string; expected: string; priority: string; severity: string; result?: { status: string; actual: string; executedAt: number } };
 
@@ -62,6 +62,7 @@ export default function TestsPage() {
   const [viewCases, setViewCases] = useState<TestCase[] | null>(null);
   const [drafts, setDrafts] = useState<Record<string, { status: string; actual: string }>>({});
   const [saving, setSaving] = useState(false);
+  const [changes, setChanges] = useState<{ id: string; title: string; from: string; to: string }[]>([]);
   const [query, setQuery] = useState("");
   const [copied, setCopied] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
@@ -162,17 +163,26 @@ export default function TestsPage() {
     return () => clearTimeout(t);
   }, [refresh]);
 
-  async function run(file?: string) {
+  async function run(file?: string, lastFailed = false) {
     setRunning(file ?? "__all__");
     setError("");
+    const prior = new Map<string, string>();
+    const scopes = file ? [lastRun[file]] : Object.values(lastRun);
+    for (const s of scopes) {
+      for (const t of s?.results ?? []) if (!prior.has(t.title)) prior.set(t.title, t.status);
+    }
     try {
       const res = await fetch("/api/tests", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "run", file }),
+        body: JSON.stringify({ action: "run", file, lastFailed: lastFailed || undefined }),
       });
       const summary = (await res.json()) as RunSummary;
       if (summary.error && !summary.results.length) setError(summary.error);
+      const transitions = summary.results
+        .filter((t) => prior.has(t.title) && prior.get(t.title) !== t.status)
+        .map((t) => ({ id: t.title, title: t.title, from: prior.get(t.title) ?? "?", to: t.status }));
+      setChanges(transitions);
       await refresh();
     } catch {
       setError("Test run failed.");
@@ -245,6 +255,9 @@ export default function TestsPage() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to record results.");
+      if (Array.isArray(data.changes) && data.changes.length) {
+        setChanges(data.changes as { id: string; title: string; from: string; to: string }[]);
+      }
       await cases(viewFile);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to record results.");
@@ -383,6 +396,35 @@ export default function TestsPage() {
 
         {error && <p className="mt-4 rounded-xl border border-white/25 bg-white/8 px-4 py-3 text-sm text-white">{error}</p>}
 
+        {changes.length > 0 && (
+          <div className="mt-4 rounded-2xl border border-white/15 bg-white/5 p-4">
+            <div className="flex items-center gap-2">
+              <p className="text-xs font-semibold text-white">Status changes ({changes.length})</p>
+              <button
+                onClick={() => setChanges([])}
+                className="ml-auto rounded-lg bg-white/8 px-2 py-1 text-[10px] text-zinc-400 hover:bg-white/15 hover:text-white"
+              >
+                Dismiss
+              </button>
+            </div>
+            <div className="mt-2 flex flex-col gap-1">
+              {changes.slice(0, 12).map((c, i) => (
+                <p key={`${c.id}-${i}`} className="text-[11px] text-zinc-400">
+                  <span className={c.from === "PASS" || c.from === "passed" ? "text-emerald-300" : "text-zinc-500"}>
+                    {c.from.toUpperCase()}
+                  </span>
+                  <span className="mx-1 text-zinc-600">&#8594;</span>
+                  <span className={c.to === "PASS" || c.to === "passed" ? "text-emerald-300" : "text-amber-300"}>
+                    {c.to.toUpperCase()}
+                  </span>
+                  <span className="ml-2 text-zinc-500">{c.title}</span>
+                </p>
+              ))}
+              {changes.length > 12 && <p className="text-[10px] text-zinc-600">+{changes.length - 12} more</p>}
+            </div>
+          </div>
+        )}
+
         <div className="mt-6 grid grid-cols-3 gap-2">
           <div className="glass rounded-2xl p-4"><p className="text-2xl font-bold">{specs.length}</p><p className="text-[10px] uppercase tracking-widest text-zinc-500">Specs</p></div>
           <div className="glass rounded-2xl p-4"><p className="text-2xl font-bold text-emerald-300">{totals.passed}</p><p className="text-[10px] uppercase tracking-widest text-zinc-500">Passed</p></div>
@@ -438,8 +480,18 @@ export default function TestsPage() {
                     </div>
                     <div className="flex gap-1.5">
                       <button onClick={() => run(s.file)} disabled={running !== null} className="rounded-lg bg-white/8 px-2.5 py-1.5 text-[11px] text-zinc-200 hover:bg-white/15 disabled:opacity-30">
-                        {running === s.file ? "Running…" : "Run"}
+                        {running === s.file ? "Running." : "Run"}
                       </button>
+                      {!!r?.failed && (
+                        <button
+                          onClick={() => run(s.file, true)}
+                          disabled={running !== null}
+                          title="Playwright --last-failed: rerun only the tests that failed last time"
+                          className="rounded-lg bg-amber-300/15 px-2.5 py-1.5 text-[11px] text-amber-200 hover:bg-amber-300/25 disabled:opacity-30"
+                        >
+                          {running === s.file ? "Running." : "Rerun failed"}
+                        </button>
+                      )}
                       <button onClick={() => view(s.file)} className="rounded-lg bg-white/8 px-2.5 py-1.5 text-[11px] text-zinc-200 hover:bg-white/15">View</button>
                       <button onClick={() => cases(s.file)} className="rounded-lg bg-white/8 px-2.5 py-1.5 text-[11px] text-zinc-200 hover:bg-white/15">Cases</button>
                       <button onClick={() => setPendingDelete(s.file)} title="Delete spec" className="rounded-lg bg-white/8 px-2.5 py-1.5 text-[11px] text-zinc-400 hover:bg-white/15 hover:text-white">
@@ -457,6 +509,23 @@ export default function TestsPage() {
                           {t.title} <span className="text-zinc-600">({t.durationMs}ms)</span>
                           {t.error && <span className="block truncate text-zinc-500">{t.error.split("\n")[0]}</span>}
                         </p>
+                      ))}
+                    </div>
+                  )}
+                  {!!r?.artifacts?.length && (
+                    <div className="mt-2 flex flex-wrap items-center gap-2 border-l border-white/15 pl-3">
+                      <span className="text-[10px] uppercase tracking-widest text-zinc-600">Trace / video</span>
+                      {r.artifacts.slice(0, 8).map((a) => (
+                        <a
+                          key={a.path}
+                          href={`/api/tests/artifact?path=${encodeURIComponent(a.path)}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          title={`${a.kind}: ${a.path}${a.kind === "trace" ? " (open with: npx playwright show-trace <file>)" : ""}`}
+                          className="rounded-lg bg-white/8 px-2 py-1 text-[10px] text-zinc-300 hover:bg-white/15 hover:text-white"
+                        >
+                          {a.kind}
+                        </a>
                       ))}
                     </div>
                   )}

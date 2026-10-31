@@ -29,6 +29,12 @@ export type SpecResult = {
   attachments: Attachment[];
 };
 
+export type RunArtifact = {
+  kind: "trace" | "video" | "screenshot" | string;
+  name: string;
+  path: string;
+};
+
 export type RunSummary = {
   ok: boolean;
   passed: number;
@@ -37,6 +43,8 @@ export type RunSummary = {
   durationMs: number;
   results: SpecResult[];
   error?: string;
+  artifacts?: RunArtifact[];
+  lastFailed?: boolean;
 };
 
 export type QaPlanDocument = {
@@ -384,7 +392,12 @@ export async function readCaseResults(file: string): Promise<Record<string, Case
 export async function saveCaseResults(
   file: string,
   results: { id: string; status: string; actual?: string }[]
-): Promise<{ saved: string; recorded: number; summary: Record<CaseStatus, number> }> {
+): Promise<{
+  saved: string;
+  recorded: number;
+  summary: Record<CaseStatus, number>;
+  changes: { id: string; title: string; from: string; to: string }[];
+}> {
   if (!Array.isArray(results) || !results.length) {
     throw new Error("results cannot be empty");
   }
@@ -394,12 +407,22 @@ export async function saveCaseResults(
   const known = new Set(cases.map((c) => c.id));
   const now = Date.now();
   const current = await readCaseResults(file);
+  const changes: { id: string; title: string; from: string; to: string }[] = [];
   for (const r of results) {
     const id = String(r.id ?? "");
     if (!known.has(id)) throw new Error(`unknown case id: ${id || "(empty)"}`);
     const status = String(r.status ?? "").toUpperCase() as CaseStatus;
     if (!STATUSES.includes(status) || status === "UNTESTED") {
       throw new Error(`invalid status for ${id}: use PASS, FAIL, BLOCKED, or SKIPPED`);
+    }
+    const from = current[id]?.status ?? "UNTESTED";
+    if (from !== status) {
+      changes.push({
+        id,
+        title: cases.find((c) => c.id === id)?.title ?? id,
+        from,
+        to: status,
+      });
     }
     current[id] = {
       id,
@@ -418,7 +441,7 @@ export async function saveCaseResults(
     },
     { UNTESTED: 0, PASS: 0, FAIL: 0, BLOCKED: 0, SKIPPED: 0 } as Record<CaseStatus, number>
   );
-  return { saved: name, recorded: results.length, summary };
+  return { saved: name, recorded: results.length, summary, changes };
 }
 
 export async function readCasesWithResults(file: string): Promise<CaseWithResult[]> {
@@ -615,7 +638,50 @@ async function typecheckSpecs(files: string[]): Promise<string | null> {
   });
 }
 
-export function runSpec(file?: string): Promise<RunSummary> {
+async function collectRunArtifacts(since: number): Promise<RunArtifact[]> {
+  const out: RunArtifact[] = [];
+  const root = join(process.cwd(), "test-results");
+  const walk = async (dir: string, depth: number) => {
+    if (depth > 4 || out.length >= 40) return;
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (out.length >= 40) return;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full, depth + 1);
+        continue;
+      }
+      const ext = entry.name.slice(entry.name.lastIndexOf(".")).toLowerCase();
+      const kind =
+        ext === ".zip" && entry.name.startsWith("trace")
+          ? "trace"
+          : ext === ".webm"
+            ? "video"
+            : [".png", ".jpg", ".jpeg"].includes(ext)
+              ? "screenshot"
+              : "";
+      if (!kind) continue;
+      try {
+        const stat = await fs.stat(full);
+        if (stat.mtimeMs < since - 2_000) continue;
+        out.push({ kind, name: entry.name, path: relative(process.cwd(), full) });
+      } catch {}
+    }
+  };
+  await walk(root, 0);
+  return out;
+}
+
+export function runSpec(
+  file?: string,
+  options?: { lastFailed?: boolean }
+): Promise<RunSummary> {
+  let startedAt = 0;
   if (runInFlight) {
     return Promise.resolve({
       ok: false,
@@ -630,7 +696,13 @@ export function runSpec(file?: string): Promise<RunSummary> {
   return new Promise((resolve) => {
     const finish = (summary: RunSummary) => {
       runInFlight = false;
-      resolve(summary);
+      if (!startedAt) {
+        resolve(summary);
+        return;
+      }
+      void collectRunArtifacts(startedAt).then((artifacts) =>
+        resolve({ ...summary, artifacts, lastFailed: !!options?.lastFailed })
+      );
     };
     let safe: string | null = null;
     try {
@@ -701,7 +773,9 @@ export function runSpec(file?: string): Promise<RunSummary> {
       const args = safe
         ? ["test", `/tests/${safe.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "--reporter=json"]
         : ["test", "--reporter=json"];
-      const started = Date.now();
+      args.push("--trace=retain-on-failure", "--video=retain-on-failure");
+      if (options?.lastFailed) args.push("--last-failed");
+      const started = startedAt = Date.now();
       execFile(
         bin,
         args,

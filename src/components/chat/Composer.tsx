@@ -118,6 +118,7 @@ export default function Composer({
               }
             }}
             rows={1}
+            maxLength={2000}
             placeholder={`Ask Anything about QA`}
             className="max-h-40 w-full resize-none bg-transparent px-4 pt-3 text-sm text-white outline-none placeholder:text-zinc-600"
           />
@@ -172,7 +173,7 @@ export default function Composer({
               </button>
             ) : (
               <button
-                disabled={!input.trim()}
+                disabled={!input.trim() && !attachments.length}
                 className="grid h-10 w-10 place-items-center rounded-2xl bg-white text-black shadow-lg shadow-white/10 transition hover:bg-zinc-200 active:scale-95 disabled:opacity-30"
               >
                 <Send size={17} />

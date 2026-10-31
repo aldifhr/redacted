@@ -14,8 +14,14 @@ function prune() {
     if (now > bucket.resetAt) buckets.delete(key);
   }
   if (buckets.size > 5000) {
-    const first = buckets.keys().next();
-    if (!first.done) buckets.delete(first.value);
+    // Trim the oldest windows down to a safe size instead of one per request.
+    const excess = buckets.size - 4000;
+    let removed = 0;
+    for (const key of buckets.keys()) {
+      if (removed >= excess) break;
+      buckets.delete(key);
+      removed += 1;
+    }
   }
 }
 
@@ -56,5 +62,8 @@ export function tryEnter(slot: string, max: number): boolean {
 
 export function leave(slot: string) {
   const current = inFlight.get(slot) ?? 0;
-  inFlight.set(slot, Math.max(0, current - 1));
+  const next = Math.max(0, current - 1);
+  // Delete at zero so finished slots never accumulate forever.
+  if (next === 0) inFlight.delete(slot);
+  else inFlight.set(slot, next);
 }

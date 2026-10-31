@@ -7,11 +7,29 @@ import { isReadOnlyCommand } from "../src/lib/browser";
 import { getBrowserTools } from "../src/lib/agent";
 import { rateLimit, tryEnter, leave } from "../src/lib/rate-limit";
 import { requireAuth } from "../src/lib/auth";
+import {
+  deleteKey,
+  fingerprintOf,
+  getKey,
+  hasKey,
+  listKeys,
+  resolveKey,
+  saveKey,
+  verifyKey,
+} from "../src/lib/key-vault";
+import { VAULT_MARKER } from "../src/lib/providers";
 // Static, not `await import()`: Playwright transpiles what the test file
 // imports statically, while a dynamic import of a .ts path falls through to
 // Node's own loader — which cannot parse TypeScript on the CI runner (Node 20).
 import { rowsToCases, suggestFileName } from "../src/lib/case-import";
 import { loadExcelJs, parseCsv, readSpreadsheet } from "../src/lib/spreadsheet";
+import { areaForUrl, looksLikeErrorPage, urlMatchesArea } from "../src/lib/report";
+import { estimateCost, fmtTokens } from "../src/lib/cost";
+import { readRunLog, startRunLog, logRunEvent, finishRunLog } from "../src/lib/run-log";
+import { withSpan } from "../src/lib/telemetry";
+import { promises as fs } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Pure unit tests for agent lib helpers (no browser, no file writes:
 // every assertion below either validates input or expects a throw
@@ -238,4 +256,129 @@ test("readSpreadsheet import path produces cases end-to-end", async () => {
   expect(cases).toHaveLength(1);
   expect(cases[0].id).toBe("LGN-1");
   expect(cases[0].steps).toEqual(["Open page", "Click login"]);
+});
+
+test("area mapping never treats every homepage as login or /cartoon as cart", () => {
+  expect(areaForUrl("https://shop.example/")).toBeNull();
+  expect(areaForUrl("https://shop.example/cartoon")).toBeNull();
+  expect(areaForUrl("https://shop.example/cart")).toBe("cart");
+  expect(urlMatchesArea("https://shop.example/", "login")).toBe(true);
+  expect(urlMatchesArea("https://shop.example/", "checkout")).toBe(false);
+  expect(urlMatchesArea("https://shop.example/cartoon", "cart")).toBe(false);
+});
+
+test("error-page detection ignores ordinary 'not found' copy", () => {
+  expect(looksLikeErrorPage("No products found in this category")).toBe(false);
+  expect(looksLikeErrorPage("404 page not found")).toBe(true);
+  expect(looksLikeErrorPage("This site can't be reached")).toBe(true);
+});
+
+test("ssrf guard blocks the extended private/reserved ranges", async () => {
+  await expect(assertPublicTarget("http://100.64.0.1/")).rejects.toThrow(/private/i);
+  await expect(assertPublicTarget("http://192.0.2.10/")).rejects.toThrow(/private/i);
+  await expect(assertPublicTarget("http://198.18.0.1/")).rejects.toThrow(/private/i);
+  await expect(assertPublicTarget("http://203.0.113.5/")).rejects.toThrow(/private/i);
+  await expect(assertPublicTarget("http://240.0.0.1/")).rejects.toThrow(/private/i);
+});
+
+test("ssrf guard unwraps hex IPv4-mapped IPv6", async () => {
+  await expect(assertPublicTarget("http://[::ffff:7f00:1]/")).rejects.toThrow(/private/i);
+});
+
+test("cost meter prices known models and formats token counts", () => {
+  expect(estimateCost("gpt-4o-mini", 1_000_000, 0)).toBeCloseTo(0.15, 6);
+  expect(estimateCost("claude-sonnet-4-5", 0, 1_000_000)).toBeCloseTo(15, 6);
+  expect(estimateCost("unknown-model", 1000, 1000)).toBeNull();
+  expect(fmtTokens(999)).toBe("999");
+  expect(fmtTokens(12_345)).toBe("12.3k");
+  expect(fmtTokens(2_500_000)).toBe("2.5M");
+});
+
+test("run log persists events and a terminal status", async () => {
+  const runId = `test-unit-${Date.now()}`;
+  try {
+    await startRunLog(runId, "session-1");
+    await logRunEvent(runId, "status", { label: "Working" });
+    await logRunEvent(runId, "done", { text: "finished" });
+    await finishRunLog(runId, "done");
+    const { meta, events } = await readRunLog(runId);
+    expect(meta?.sessionId).toBe("session-1");
+    expect(meta?.status).toBe("done");
+    expect(events.map((e) => e.type)).toEqual(["status", "done"]);
+  } finally {
+    await fs.unlink(join(process.cwd(), ".runs", `${runId}.jsonl`)).catch(() => {});
+    await fs.unlink(join(process.cwd(), ".runs", `${runId}.meta.json`)).catch(() => {});
+  }
+});
+
+// Vault isolasi lewat KEY_VAULT_DIR (temp dir) supaya tidak menyentuh
+// logs/keys.vault.json asli di mesin dev.
+async function withVaultDir(fn: () => Promise<void> | void) {
+  const dir = await fs.mkdtemp(join(tmpdir(), "key-vault-"));
+  const prev = process.env.KEY_VAULT_DIR;
+  process.env.KEY_VAULT_DIR = dir;
+  try {
+    await fn();
+  } finally {
+    if (prev === undefined) delete process.env.KEY_VAULT_DIR;
+    else process.env.KEY_VAULT_DIR = prev;
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("key vault encrypts at rest, verifies by hash, and never writes the raw key", async () => {
+  await withVaultDir(async () => {
+    expect(hasKey("openai")).toBe(false);
+    expect(getKey("openai")).toBeNull();
+
+    const fingerprint = saveKey("openai", "sk-test-1234567890");
+    expect(fingerprint).toMatch(/^[0-9a-f]{12}$/);
+    expect(fingerprint).toBe(fingerprintOf("sk-test-1234567890"));
+    expect(hasKey("openai")).toBe(true);
+    expect(getKey("openai")).toBe("sk-test-1234567890");
+
+    // file di disk memuat ciphertext + hash, tidak pernah key mentah
+    const raw = await fs.readFile(join(process.env.KEY_VAULT_DIR!, "keys.vault.json"), "utf8");
+    expect(raw).not.toContain("sk-test-1234567890");
+    expect(raw).toContain(fingerprint);
+
+    expect(verifyKey("openai", "sk-test-1234567890")).toBe(true);
+    expect(verifyKey("openai", "sk-wrong-1234567890")).toBe(false);
+
+    expect(listKeys()).toEqual([
+      { provider: "openai", fingerprint, updatedAt: expect.any(Number) },
+    ]);
+
+    expect(deleteKey("openai")).toBe(true);
+    expect(deleteKey("openai")).toBe(false);
+    expect(getKey("openai")).toBeNull();
+    expect(listKeys()).toEqual([]);
+  });
+});
+
+test("resolveKey prefers the presented key, falls back to the vault, then throws", async () => {
+  await withVaultDir(() => {
+    // tanpa vault: key yang dikirim menang
+    expect(resolveKey("openai", "sk-presented-123456")).toBe("sk-presented-123456");
+    // tanpa vault dan tanpa key: error yang mengarahkan ke /settings
+    expect(() => resolveKey("openai", "")).toThrow(/API key is required/);
+    expect(() => resolveKey("anthropic", VAULT_MARKER)).toThrow(/API key is required/);
+
+    saveKey("openai", "sk-vault-1234567890");
+    // marker/empty → pakai vault
+    expect(resolveKey("openai", "")).toBe("sk-vault-1234567890");
+    expect(resolveKey("openai", VAULT_MARKER)).toBe("sk-vault-1234567890");
+    // key yang dikirim tetap menang atas vault
+    expect(resolveKey("openai", "sk-presented-123456")).toBe("sk-presented-123456");
+  });
+});
+
+test("withSpan passes results through and rethrows without swallowing", async () => {
+  // tanpa SDK terdaftar tracer no-op, tapi kontrak helper tetap harus jalan
+  await expect(withSpan("test.ok", async () => 42)).resolves.toBe(42);
+  await expect(
+    withSpan("test.fail", async () => {
+      throw new Error("boom");
+    })
+  ).rejects.toThrow("boom");
 });

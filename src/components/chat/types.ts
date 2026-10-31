@@ -16,7 +16,7 @@ export type Msg = {
   requestedAreas?: string[];
   completedAreas?: string[];
   coverage?: { requestedAreas: string[]; visitedAreas: string[]; coveredAreas: string[]; missingAreas: string[] };
-  stopReason?: "completed" | "action_limit" | "model_timeout" | "model_round_limit";
+  stopReason?: "completed" | "action_limit" | "model_timeout" | "model_round_limit" | "budget_limit";
   time?: string;
 };
 

@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { listSpecs, readSpec, deleteSpec, deleteCases, readCasesWithResults, saveCaseResults, saveCases, saveSpec, clearRunLog, runSpec, recordRun, loadLastRun, loadRunLog } from "@/lib/specs";
+import { listSpecs, readSpec, deleteSpec, deleteCases, readCaseResults, readCasesWithResults, saveCaseResults, saveCases, saveSpec, clearRunLog, runSpec, recordRun, loadLastRun, loadRunLog } from "@/lib/specs";
 import { guardApi } from "@/lib/api-guard";
 
 const TestsBodySchema = z.object({
   action: z.enum(["get", "delete", "cases", "results", "record", "import", "save", "clear-history", "run"]).optional(),
   file: z.string().max(200).optional(),
   content: z.string().max(200_000).optional(),
+  lastFailed: z.boolean().optional(),
   results: z.array(z.object({
     id: z.string().max(20),
     status: z.string().max(10),
@@ -85,7 +86,7 @@ export async function POST(req: Request) {
         if (!body.file) {
            return NextResponse.json({ error: "file is required" }, { status: 400 });
         }
-        return NextResponse.json({ cases: await readCasesWithResults(body.file) });
+        return NextResponse.json({ results: await readCaseResults(body.file) });
       }
       case "record": {
         if (!body.file) {
@@ -116,7 +117,7 @@ export async function POST(req: Request) {
         return NextResponse.json(await saveSpec(body.file, body.content));
       }
       case "run": {
-        const summary = await runSpec(body.file || undefined);
+        const summary = await runSpec(body.file || undefined, { lastFailed: body.lastFailed });
         await recordRun(body.file || null, summary);
         return NextResponse.json(summary);
       }

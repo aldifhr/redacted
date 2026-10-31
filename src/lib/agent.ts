@@ -5,6 +5,7 @@ import { saveSpec, runSpec, mergeCases, saveCaseResults, savePlanDocument, recor
 import { saveFact, forgetFact } from "./memory";
 import { RUN_CANCELLED } from "./runs";
 import { recordToolLog } from "./tool-logs";
+import { withSpan } from "./telemetry";
 
 const TestCaseSchema = z.object({
   id: z.string().describe("Unique ID, for example TC-001"),
@@ -82,7 +83,10 @@ export function getBrowserTools(
       } catch {}
       const started = Date.now();
       try {
-        const output = await fn(input);
+        const output = await withSpan(`tool.${toolName}`, () => fn(input), {
+          "tool.name": toolName,
+          ...(sid ? { "run.id": sid } : {}),
+        });
         const loggedInput = toolName === "browser_type"
           ? { ...input, text: "[redacted]" }
           : input;
@@ -225,7 +229,10 @@ export function getBrowserTools(
     browser_close: tool({
       description: "Close the browser",
       inputSchema: z.object({}),
-      execute: wrap("browser_close", async () => browser.closeBrowser()),
+      execute: wrap("browser_close", async () => {
+        await browser.closeSession(sid ?? "");
+        return { closed: true };
+      }),
     }),
     browser_upload: tool({
       description: "Upload a text file into a file input (content is sent inline)",

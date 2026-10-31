@@ -1,5 +1,5 @@
 import { promises as fs, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const API = "https://skills.sh/api/v1";
 const SKILLS_DIR = join(process.cwd(), ".skills");
@@ -153,7 +153,7 @@ export async function listInstalledSkills(): Promise<InstalledSkill[]> {
 
 export async function setSkillDisabled(id: string, disabled: boolean) {
   const directory = skillPath(id);
-  const source = await readSource(directory.split("/").pop() ?? "");
+  const source = await readSource(basename(directory));
   await fs.mkdir(directory, { recursive: true });
   await fs.writeFile(
     join(directory, "source.json"),

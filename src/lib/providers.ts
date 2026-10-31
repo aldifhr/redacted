@@ -28,6 +28,11 @@ export const DEFAULT_BASE_URLS: Record<ProviderId, string> = {
   anthropic: "https://api.anthropic.com/v1",
 };
 
+// Marker di settings.keys[provider]: key asli sudah disimpan di server vault
+// (logs/keys.vault.json, terenkripsi). Browser hanya menyimpan marker ini —
+// server memperlakukan marker sebagai "pakai key dari vault".
+export const VAULT_MARKER = "vault";
+
 export function getModel(
   provider: ProviderId,
   model: string,

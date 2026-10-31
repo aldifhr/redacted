@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { ArrowLeft, CheckCircle2, ClipboardList, RotateCw, Trash2, XCircle } from "lucide-react";
 
@@ -13,6 +14,7 @@ type ToolLog = {
   input: unknown;
   output?: unknown;
   error?: string;
+  runId?: string;
 };
 
 function display(value: unknown) {
@@ -25,36 +27,41 @@ function display(value: unknown) {
 }
 
 export default function LogsPage() {
-  const [logs, setLogs] = useState<ToolLog[]>([]);
   const [filter, setFilter] = useState("all");
-  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const queryClient = useQueryClient();
 
-  async function refresh() {
-    try {
+  const logsQuery = useQuery({
+    queryKey: ["logs"],
+    queryFn: async (): Promise<ToolLog[]> => {
       const response = await fetch("/api/logs", { cache: "no-store" });
       const data = await response.json();
-      if (Array.isArray(data.logs)) setLogs(data.logs);
-    } catch {}
-  }
+      return Array.isArray(data.logs) ? (data.logs as ToolLog[]) : [];
+    },
+    // Tool log bisa bertambah dari run lain — polling 5s seperti sebelumnya.
+    refetchInterval: 5_000,
+  });
 
-  useEffect(() => {
-    const initial = setTimeout(refresh, 0);
-    const interval = setInterval(refresh, 5_000);
-    return () => {
-      clearTimeout(initial);
-      clearInterval(interval);
-    };
-  }, []);
+  const clearMutation = useMutation({
+    mutationFn: async () => {
+      const response = await fetch("/api/logs", { method: "DELETE" });
+      if (!response.ok) throw new Error("Failed to clear logs");
+    },
+    onSuccess: () => {
+      setError("");
+      void queryClient.invalidateQueries({ queryKey: ["logs"] });
+    },
+    onError: (e) => {
+      setError(e instanceof Error ? e.message : "Failed to clear logs");
+    },
+  });
 
-  async function clear() {
+  const logs = useMemo(() => logsQuery.data ?? [], [logsQuery.data]);
+
+  function clear() {
     if (!window.confirm("Delete all tool logs?")) return;
-    setBusy(true);
-    try {
-      await fetch("/api/logs", { method: "DELETE" });
-      setLogs([]);
-    } finally {
-      setBusy(false);
-    }
+    setError("");
+    clearMutation.mutate();
   }
 
   const visible = useMemo(
@@ -72,10 +79,10 @@ export default function LogsPage() {
             <ArrowLeft size={15} /> Chat
           </Link>
           <div className="ml-auto flex gap-2">
-            <button onClick={refresh} className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-300 hover:bg-white/10">
-              <RotateCw size={14} /> Refresh
+            <button onClick={() => void logsQuery.refetch()} disabled={logsQuery.isFetching} className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-300 hover:bg-white/10 disabled:opacity-30">
+              <RotateCw size={14} className={logsQuery.isFetching ? "animate-spin" : ""} /> Refresh
             </button>
-            <button onClick={clear} disabled={busy || !logs.length} className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-300 hover:bg-white/10 disabled:opacity-30">
+            <button onClick={clear} disabled={clearMutation.isPending || !logs.length} className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-zinc-300 hover:bg-white/10 disabled:opacity-30">
               <Trash2 size={14} /> Clear
             </button>
           </div>
@@ -88,6 +95,8 @@ export default function LogsPage() {
              <p className="mt-1 text-sm text-zinc-500">Audit browser actions, shell commands, and file reads.</p>
           </div>
         </header>
+
+        {error && <p className="mt-4 rounded-xl border border-red-400/20 bg-red-400/5 px-4 py-3 text-sm text-red-200">{error}</p>}
 
         <div className="mt-6 grid grid-cols-2 gap-2 sm:grid-cols-3">
           <div className="glass rounded-2xl p-4"><p className="text-2xl font-bold">{logs.length}</p><p className="text-[10px] uppercase tracking-widest text-zinc-500">Total calls</p></div>

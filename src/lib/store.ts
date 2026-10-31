@@ -1,6 +1,5 @@
 import { DEFAULT_BASE_URLS, PROVIDERS, ProviderId } from "./providers";
 import { format } from "date-fns";
-import { id } from "date-fns/locale";
 
 export type Role = "user" | "assistant";
 export type ToolCall = { tool: string; input: unknown };
@@ -31,6 +30,8 @@ export const ATTACHMENT_CAPS = [8_000, 20_000, 50_000] as const;
 export type Settings = {
   provider: ProviderId;
   model: string;
+  // Nilai tiap entri: VAULT_MARKER (key asli sudah di vault server) atau key
+  // mentah legacy yang masih hanya di browser ini.
   keys: Partial<Record<ProviderId, string>>;
   baseUrls: Record<ProviderId, string>;
   attachmentCap: number;
@@ -39,6 +40,7 @@ export type Settings = {
 const S_KEY = "pw_settings_v1";
 const L_KEY = "pw_sessions_v1";
 const A_KEY = "pw_active_v1";
+const MAX_SESSIONS = 100;
 
 export function defaultSettings(): Settings {
   return {
@@ -142,7 +144,8 @@ export function loadSessions(): Session[] {
 
 export function saveSessions(ss: Session[]) {
   if (typeof window === "undefined") return;
-  const capped = ss.slice(0, 30);
+  // Keep a generous bounded history: 30 silently discarded older chats.
+  const capped = ss.slice(0, MAX_SESSIONS);
   try {
     localStorage.setItem(L_KEY, JSON.stringify(capped));
   } catch {
@@ -172,7 +175,7 @@ export function saveActiveId(id: string) {
 export function fmtTime(ts: number): string {
   if (!ts) return "";
   try {
-    return format(new Date(ts), "d MMM, HH:mm", { locale: id });
+    return format(new Date(ts), "d MMM, HH:mm");
   } catch {
     return "";
   }
