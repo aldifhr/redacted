@@ -39,7 +39,7 @@ export const ReportDataSchema = z.object({
 });
 
 export type ReportData = z.infer<typeof ReportDataSchema>;
-export type ReportStatus = "Verified" | "Visited only" | "Planned/Unverified";
+export type ReportStatus = "Verified" | "Partially verified" | "Visited only" | "Planned/Unverified";
 
 export type EvidenceEntry = {
   tool: string;
@@ -52,12 +52,18 @@ export type EvidenceEntry = {
   pass?: boolean;
   /** Assertion kind, when tool is test_assert. */
   assertKind?: string;
+  /** Evidence store ID for the full payload (phase 3+). */
+  evidenceId?: string;
 };
 
 export type Coverage = {
   requestedAreas: string[];
   visitedAreas: string[];
   coveredAreas: string[];
+  /** Backend-authoritative per-area statuses (phase 8). */
+  areaStatuses?: Record<string, string>;
+  /** Overall run status (phase 9). */
+  overall?: "COMPLETE" | "PARTIAL" | "FAILED" | "BLOCKED";
 };
 
 export type TestRunSummary = {
@@ -340,9 +346,18 @@ function sanitizeList(lines: string[], ledger: EvidenceEntry[]): string[] {
   return out;
 }
 
-/** Server-owned status: LLM status is ignored entirely. */
+/** Server-owned status: LLM status is ignored entirely. Backend-authoritative
+ *  per-area statuses (phase 8) win when present; the URL-set heuristic is
+ *  only the legacy fallback. */
 export function resolveStatus(area: string, coverage: Coverage): ReportStatus {
   const key = norm(area);
+  const authoritative = coverage.areaStatuses?.[area] ?? coverage.areaStatuses?.[key];
+  if (authoritative) {
+    if (authoritative === "VERIFIED") return "Verified";
+    if (authoritative === "PARTIALLY_VERIFIED") return "Partially verified";
+    if (authoritative === "VISITED" || authoritative === "INSPECTED") return "Visited only";
+    return "Planned/Unverified";
+  }
   if (coverage.coveredAreas.some((a) => norm(a) === key)) return "Verified";
   if (coverage.visitedAreas.some((a) => norm(a) === key)) return "Visited only";
   return "Planned/Unverified";
@@ -429,7 +444,20 @@ export function renderReportMarkdown(
     coverage.requestedAreas.length > 0 &&
     coverage.requestedAreas.every((a) => coverage.coveredAreas.some((c) => norm(c) === norm(a)));
 
-  lines.push(titleComplete ? "## Exploration report (complete)" : "## Partial exploration");
+  // Phase 9: overall status is backend-owned; a token-limit stop can
+  // never render as complete unless every area truly verified.
+  const overall = coverage.overall ?? (titleComplete ? "COMPLETE" : "PARTIAL");
+  lines.push(
+    overall === "COMPLETE"
+      ? "## Exploration report (complete)"
+      : overall === "FAILED"
+        ? "## Exploration report (failed)"
+        : overall === "BLOCKED"
+          ? "## Exploration report (blocked)"
+          : "## Partial exploration"
+  );
+  lines.push("");
+  lines.push(`**Overall status: ${overall}** (server-computed from evidence)`);
   lines.push("");
   const cleanSummary = sanitizeList([data.summary], ledger);
   lines.push(cleanSummary[0] ?? "Exploration finished. See areas table for verified evidence.");
@@ -460,9 +488,11 @@ export function renderReportMarkdown(
     const notes =
       status === "Verified"
         ? combined
-        : status === "Visited only"
-          ? `Reached but not verified with snapshot/text/assert. ${combined}`.trim()
-          : `Not covered this run. ${found?.gaps ?? ""}`.trim();
+        : status === "Partially verified"
+          ? `Reached and inspected, but no passing assertion yet — not verified. ${combined}`.trim()
+          : status === "Visited only"
+            ? `Reached but not verified with snapshot/text/assert. ${combined}`.trim()
+            : `Not covered this run. ${found?.gaps ?? ""}`.trim();
     return { status, features: features.join("; ") || "—", notes: notes || "—" };
   };
   for (const requested of coverage.requestedAreas) {

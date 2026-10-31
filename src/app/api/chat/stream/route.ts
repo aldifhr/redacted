@@ -25,6 +25,10 @@ import { appendEvidence, type EvidenceKind } from "@/lib/evidence-store";
 import { checkDuplicate, clearObservations, rememberObservation } from "@/lib/observation-dedup";
 import { compactToolResult, duplicateMarker, rewriteToolOutputs } from "@/lib/observation-compact";
 import { composeExecutionPrompt } from "@/lib/context";
+import { buildTasks, completedAreas as completedTaskAreas, renderTaskState, selectNextTask, type ExplorationTask } from "@/lib/task-state";
+import { refreshTaskStatuses, summarizeCoverage } from "@/lib/coverage";
+import { compactHistory, shouldCompact } from "@/lib/context-compactor";
+import { evaluateBudget, loadBudgets, type Budgets } from "@/lib/budget";
 import { finishRunLog, logRunEvent, startRunLog } from "@/lib/run-log";
 import {
   clearRunTokens,
@@ -39,12 +43,9 @@ import {
 import { parseExplorationScope, readExplorationCheckpoint, readLatestCheckpoint, saveExplorationCheckpoint } from "@/lib/exploration";
 import {
   ReportDataSchema,
-  areaForUrl,
-  areaSignalsFor,
   looksLikeErrorPage,
   renderFallbackReport,
   renderReportMarkdown,
-  urlMatchesArea,
   type EvidenceEntry,
   type TestRunSummary,
 } from "@/lib/report";
@@ -195,14 +196,20 @@ async function handleStream(
   const currentArea = scope.areas.find((area) => !completedAreas.includes(area)) ?? scope.areas[0];
   const nextArea = scope.areas.find((area) => area !== currentArea && !completedAreas.includes(area)) ?? "";
   // Execution prompt composed from typed context layers (audit phase 3):
-  // static instructions + scope block + rules.
-  const executionPrompt = composeExecutionPrompt({
-    systemPrompt,
-    scope,
-    completedAreas,
-    currentArea,
-    nextArea,
-  });
+  // static instructions + scope block + rules + server-owned task board
+  // (phase 6 — the model never rediscovers completed tasks). The system
+  // half is stable per run; the task board is re-rendered per round so
+  // the model always sees current server-owned statuses.
+  const tasks: ExplorationTask[] = buildTasks(scope);
+  const buildExecutionPrompt = () =>
+    composeExecutionPrompt({
+      systemPrompt,
+      scope,
+      completedAreas,
+      currentArea,
+      nextArea,
+      taskBoard: renderTaskState(tasks, selectNextTask(tasks)),
+    });
   // Skill exposure telemetry: which skill ids were loaded into this run's prompt.
   const runSkillIds = loadInstalledSkillsSync().map((s) => s.id);
   const wantsVisualEvidence = messages.some(
@@ -359,9 +366,9 @@ async function handleStream(
         let fullText = "";
         let usage: unknown = null;
         let tokensUsed = 0;
-        // Hard per-run token ceiling. Generous by default; override with
-        // MAX_RUN_TOKENS (0 disables the ceiling).
-        const tokenBudget = Math.max(0, Number(process.env.MAX_RUN_TOKENS ?? 1_000_000) || 0);
+        // Phase 7: configurable budgets (env-driven, per-phase shares).
+        const budgets: Budgets = loadBudgets();
+        const runStartedAt = Date.now();
         let modelRounds = 0;
         let lastShotUrl: string | null = null;
         let lastLabel = "Working…";
@@ -399,12 +406,24 @@ async function handleStream(
             return;
           }
           const runTokens = getRunTokenStats(runId);
-          if (tokenBudget > 0 && (runTokens?.totalTokens ?? 0) >= tokenBudget) {
+          const verdict = evaluateBudget({
+            budgets,
+            phaseTokens: {
+              EXPLORATION: runTokens?.byPhase.EXPLORATION.totalTokens ?? 0,
+              VERIFICATION: runTokens?.byPhase.VERIFICATION.totalTokens ?? 0,
+              REPORTING: runTokens?.byPhase.REPORTING.totalTokens ?? 0,
+            },
+            totalTokens: runTokens?.totalTokens ?? 0,
+            modelRounds,
+            browserActions: browserActionsExecuted,
+            elapsedMs: Date.now() - runStartedAt,
+          });
+          if (verdict.exceeded) {
             stopReason = "budget_limit";
             capped = true;
             send("status", {
               label: "Token budget reached",
-              thinking: `Run stopped after ${(runTokens?.totalTokens ?? 0).toLocaleString()} tokens (limit ${tokenBudget.toLocaleString()}).`,
+              thinking: `Run stopped: ${verdict.reason} (${(runTokens?.totalTokens ?? 0).toLocaleString()} tokens used, limit ${budgets.maxRunTokens.toLocaleString()}). Completed evidence and task state are saved; unfinished areas stay incomplete.`,
               phase: "Reporting",
               agent: "main",
             });
@@ -422,13 +441,37 @@ async function handleStream(
               agent: "main",
             });
           }
+           // Phase 5: compact history when the context budget is exceeded.
+           // The summary is server-built from the evidence ledger and task
+           // board (no LLM call, no invented facts); raw payloads stay in
+           // the evidence store, retrievable by ID.
+           if (shouldCompact(modelMessages, budgets.maxContextTokens)) {
+             const currentUrl = (await browser.pageUrl(runId).catch(() => null)) ?? "";
+             const compaction = compactHistory({
+               messages: modelMessages,
+               tasks,
+               ledger,
+               userRequest: latestUserPrompt,
+               currentUrl,
+               maxRecentTurns: 12,
+             });
+             if (compaction.compacted) {
+               modelMessages = compaction.messages;
+               send("status", {
+                 label: lastLabel,
+                 thinking: `Context compacted — ${compaction.droppedTurns} earlier turns replaced by a server-built summary; full evidence remains in the store.`,
+                 phase: lastPhase,
+                 agent: "main",
+               });
+             }
+           }
            // Client aborts (Stop button, tab close) must cancel the model call
            // immediately — not after the 120s step timeout.
            const stepStarted = Date.now();
            const stepSignal = AbortSignal.any([req.signal, AbortSignal.timeout(STEP_TIMEOUT_MS)]);
            const outcome = await generateText({
              model: llm,
-             system: executionPrompt,
+             system: buildExecutionPrompt(),
              messages: modelMessages,
              tools: browserBudgetReached ? reportingTools : tools,
              stopWhen: stepCountIs(1),
@@ -487,7 +530,7 @@ async function handleStream(
             usage: result.usage as TokenUsageInput | undefined,
             requestChars: Number.isFinite(result.usage?.inputTokens)
               ? undefined
-              : executionPrompt.length + JSON.stringify(modelMessages).length,
+              : buildExecutionPrompt().length + JSON.stringify(modelMessages).length,
             responseChars: (result.text ?? "").length,
             durationMs: Date.now() - stepStarted,
           });
@@ -571,45 +614,11 @@ async function handleStream(
                 const errorPage =
                   ["browser_snapshot", "browser_get_text"].includes(toolName) &&
                   looksLikeErrorPage(pageText);
-                const observed = areaForUrl(output.url);
-                if (observed) {
-                  observedAreas.add(observed);
-                  if (["browser_snapshot", "browser_get_text", "test_assert"].includes(toolName) && !errorPage) {
-                    verifiedAreas.add(observed);
-                  }
-                }
-                // Generic URL matching: any requested area name verifies by
-                // URL on any site ("/user-settings" ↔ "user settings").
-                // Only requested areas are tracked, to avoid polluting coverage.
-                if (!errorPage) {
-                  for (const area of scope.areas) {
-                    if (!urlMatchesArea(output.url, area)) continue;
-                    observedAreas.add(area.toLowerCase());
-                    if (["browser_snapshot", "browser_get_text", "test_assert"].includes(toolName)) {
-                      verifiedAreas.add(area.toLowerCase());
-                    }
-                  }
-                }
-                // Interaction areas (navigation/footer) have no dedicated URL:
-                // detect them from selectors used and snapshot content.
-                // Only requested areas are tracked, to avoid polluting coverage.
-                if (!errorPage) {
-                  const signalExcerpt =
-                    typeof output.elements === "string"
-                      ? output.elements
-                      : typeof output.text === "string"
-                        ? output.text
-                        : typeof output.actual === "string"
-                          ? output.actual
-                          : "";
-                  for (const signal of areaSignalsFor(selector, signalExcerpt)) {
-                    if (!scope.areas.some((a) => a.toLowerCase() === signal)) continue;
-                    observedAreas.add(signal);
-                    if (["browser_snapshot", "browser_get_text", "test_assert"].includes(toolName)) {
-                      verifiedAreas.add(signal);
-                    }
-                  }
-                }
+                // Phase 8: area coverage is computed from the evidence
+                // ledger by lib/coverage after this loop — the old
+                // URL/substring heuristic (any snapshot of a matching URL
+                // marked the area Verified) is gone. A passing assertion
+                // is now required for VERIFIED.
                 // Record evidence for server-side report validation.
                 if (isBrowserAction(toolName)) {
                   const url = typeof output.url === "string" ? output.url : "";
@@ -681,6 +690,7 @@ async function handleStream(
                           assertKind: typeof rawArgs.kind === "string" ? rawArgs.kind : undefined,
                         }
                       : {}),
+                    ...(evidenceId ? { evidenceId } : {}),
                   });
                 }
                 // Fix 3: record test execution outcomes for the report's
@@ -755,6 +765,21 @@ async function handleStream(
             }
           }
 
+          // Phase 8: recompute every task's status from the evidence
+          // ledger, then re-derive the coverage sets the rest of the loop
+          // uses. Statuses are backend-owned; the model cannot claim them.
+          const refreshedTasks = refreshTaskStatuses(tasks, ledger);
+          tasks.splice(0, tasks.length, ...refreshedTasks);
+          verifiedAreas.clear();
+          observedAreas.clear();
+          for (const t of tasks) {
+            if (t.status === "VERIFIED") verifiedAreas.add(t.area.toLowerCase());
+            if (t.status !== "NOT_STARTED" && t.status !== "SKIPPED") {
+              observedAreas.add(t.area.toLowerCase());
+            }
+          }
+          completedAreas = completedTaskAreas(tasks);
+
           modelMessages = [
             ...modelMessages,
             ...rewriteToolOutputs(result.response.messages, compactOverrides),
@@ -826,16 +851,31 @@ async function handleStream(
             nextArea: scope.areas.find((area) => !completedAreas.includes(area)) ?? "",
             lastAction: "completed",
           });
+        } else {
+          // Phase 7 graceful exhaustion: persist task state so a resume
+          // continues from the task board, not from a lost transcript.
+          await saveExplorationCheckpoint({
+            runId,
+            ...scope,
+            completedAreas,
+            currentArea,
+            nextArea: scope.areas.find((area) => !completedAreas.includes(area)) ?? "",
+            lastAction: `stopped:${stopReason}`,
+          }).catch(() => null);
         }
 
         const finalBrowserActions = browserActionsExecuted;
-        const coveredAreas = scope.areas.filter((area) => verifiedAreas.has(area.toLowerCase()));
-        const visitedAreas = scope.areas.filter((area) => observedAreas.has(area.toLowerCase()));
-        const coverageStatus = coveredAreas.length === scope.areas.length && scope.areas.length > 0 ? "COMPLETE" : "PARTIAL";
+        // Phase 8/9: coverage comes from the backend-computed task board.
+        const coverageSummary = summarizeCoverage(tasks, { capped, stopReason });
+        const coveredAreas = coverageSummary.coveredAreas;
+        const visitedAreas = coverageSummary.visitedAreas;
+        const coverageStatus = coverageSummary.overall;
         const coverage = {
-          requestedAreas: scope.areas,
+          requestedAreas: coverageSummary.requestedAreas,
           visitedAreas,
           coveredAreas,
+          areaStatuses: coverageSummary.areaStatuses,
+          overall: coverageSummary.overall,
         };
         // STRUCTURED REPORT: the model returns DATA ONLY (JSON). Status,
         // locator filtering, banned-claim stripping, and Markdown rendering
@@ -949,7 +989,7 @@ async function handleStream(
             : stopReason === "model_round_limit"
               ? `\n\n---\nStopped after ${maxModelRounds} model rounds with ${finalBrowserActions} browser actions. Ask me to continue from where it left off.`
               : stopReason === "budget_limit"
-                ? `\n\n---\nStopped early: this run reached its ${tokenBudget.toLocaleString()}-token budget (${tokensUsed.toLocaleString()} used). Raise MAX_RUN_TOKENS or split the request.`
+                ? `\n\n---\nStopped early: this run reached its ${budgets.maxRunTokens.toLocaleString()}-token budget (${tokensUsed.toLocaleString()} used). Raise MAX_RUN_TOKENS or split the request. Completed evidence is saved; unfinished areas are marked incomplete, not verified.`
                 : "";
         const runFacts = `\n\n---\nAUTHORITATIVE EXPLORATION STATUS: ${coverageStatus}. Run facts (server-verified): ${finalBrowserActions} browser actions executed. Verified areas: ${coveredAreas.length ? coveredAreas.join(", ") : "none"}.${visitedAreas.filter((area) => !coveredAreas.includes(area)).length ? ` Visited only: ${visitedAreas.filter((area) => !coveredAreas.includes(area)).join(", ")}.` : ""}${scope.areas.filter((area) => !coveredAreas.includes(area)).length ? ` Next requested area: ${scope.areas.find((area) => !coveredAreas.includes(area))}.` : " All requested areas verified."}${scopeWarning ? ` Warning: ${scopeWarning}` : ""}`;
         send("done", {
@@ -979,6 +1019,22 @@ async function handleStream(
           provider,
           capped,
           tokenStats: getRunTokenStats(runId),
+          tasks: tasks.map((t) => ({
+            id: t.id,
+            area: t.area,
+            status: t.status,
+            evidenceIds: t.evidenceIds,
+            ...(t.blockedReason ? { blockedReason: t.blockedReason } : {}),
+          })),
+          budget: {
+            maxRunTokens: budgets.maxRunTokens,
+            usedTokens: getRunTokenStats(runId)?.totalTokens ?? 0,
+            phaseTokens: {
+              EXPLORATION: getRunTokenStats(runId)?.byPhase.EXPLORATION.totalTokens ?? 0,
+              VERIFICATION: getRunTokenStats(runId)?.byPhase.VERIFICATION.totalTokens ?? 0,
+              REPORTING: getRunTokenStats(runId)?.byPhase.REPORTING.totalTokens ?? 0,
+            },
+          },
           // Fix D: persist the evidence ledger + test outcomes in done.data so
           // any report can be re-audited post-hoc (excerpts trimmed for size).
           ledger: ledger.map((e) => ({

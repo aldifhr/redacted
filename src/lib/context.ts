@@ -180,6 +180,7 @@ export function composeExecutionPrompt(input: {
   completedAreas: string[];
   currentArea: string;
   nextArea: string;
+  taskBoard?: string;
 }): string {
   const { systemPrompt, scope, completedAreas, currentArea, nextArea } = input;
   const budgetSentence = Number.isFinite(scope.maxActions)
@@ -188,7 +189,8 @@ export function composeExecutionPrompt(input: {
   return (
     `${systemPrompt}\n\n---\n# Current exploration scope\n` +
     `${JSON.stringify({ ...scope, completedAreas, currentArea, nextArea }, null, 2)}\n` +
-    `${EXPLORATION_RULES} ${budgetSentence}`
+    `${EXPLORATION_RULES} ${budgetSentence}` +
+    (input.taskBoard ? `\n\n${input.taskBoard}` : "")
   );
 }
 

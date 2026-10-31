@@ -23,7 +23,7 @@ import { VAULT_MARKER } from "../src/lib/providers";
 // Node's own loader — which cannot parse TypeScript on the CI runner (Node 20).
 import { rowsToCases, suggestFileName } from "../src/lib/case-import";
 import { loadExcelJs, parseCsv, readSpreadsheet } from "../src/lib/spreadsheet";
-import { areaForUrl, looksLikeErrorPage, urlMatchesArea } from "../src/lib/report";
+import { areaForUrl, looksLikeErrorPage, resolveStatus, renderReportMarkdown, urlMatchesArea } from "../src/lib/report";
 import { estimateCost, fmtTokens } from "../src/lib/cost";
 import {
   clearRunTokens,
@@ -66,6 +66,16 @@ import {
   duplicateMarker,
   rewriteToolOutputs,
 } from "../src/lib/observation-compact";
+import {
+  buildTasks,
+  completedAreas as completedTaskAreas,
+  pendingAreas as pendingTaskAreas,
+  renderTaskState,
+  selectNextTask,
+} from "../src/lib/task-state";
+import { computeAreaStatus, refreshTaskStatuses, summarizeCoverage } from "../src/lib/coverage";
+import { compactHistory, estimateMessagesTokens, shouldCompact } from "../src/lib/context-compactor";
+import { evaluateBudget, loadBudgets, phaseBudget } from "../src/lib/budget";
 import { withSpan } from "../src/lib/telemetry";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
@@ -741,8 +751,248 @@ test("buildSystemContext totals instruction and rule sizes", () => {
   expect(sys.rules).toBe("de");
 });
 
-// ── phase 4: observation dedup + tool-result compaction ──
+// ── phase 6: task-oriented execution state ──
 
+test("task board builds one task per area with login dependencies", () => {
+  const tasks = buildTasks({
+    site: "https://www.saucedemo.com",
+    areas: ["login", "products", "cart", "checkout"],
+    priority: "medium",
+    maxActions: Number.POSITIVE_INFINITY,
+    continue: false,
+  });
+  expect(tasks).toHaveLength(4);
+  expect(tasks.every((t) => t.status === "NOT_STARTED")).toBe(true);
+  expect(tasks[0].dependencies).toEqual([]);
+  expect(tasks[1].dependencies).toEqual(["login"]); // products needs auth
+  expect(tasks[3].verificationCriteria.some((c) => c.includes("passing assertion"))).toBe(true);
+  const board = renderTaskState(tasks, tasks[0]);
+  expect(board).toContain("[NOT_STARTED] login");
+  expect(board).toContain("Current task: login");
+});
+
+test("selectNextTask skips completed work and respects dependencies", () => {
+  const tasks = buildTasks({
+    site: "https://x.test",
+    areas: ["login", "products", "cart"],
+    priority: "medium",
+    maxActions: Number.POSITIVE_INFINITY,
+    continue: false,
+  });
+  expect(selectNextTask(tasks)?.area).toBe("login");
+  tasks[0].status = "VERIFIED";
+  expect(selectNextTask(tasks)?.area).toBe("products");
+  tasks[1].status = "VERIFIED";
+  expect(selectNextTask(tasks)?.area).toBe("cart");
+  tasks[2].status = "VERIFIED";
+  expect(selectNextTask(tasks)).toBeNull();
+  expect(completedTaskAreas(tasks)).toEqual(["login", "products", "cart"]);
+  expect(pendingTaskAreas(tasks)).toEqual([]);
+});
+
+// ── phase 8: backend-authoritative coverage (the false-Verified fix) ──
+
+test("a snapshot alone can never verify an area — the footer bug is dead", () => {
+  const footerEvidence = [
+    {
+      tool: "browser_snapshot",
+      url: "https://www.saucedemo.com/inventory.html",
+      excerpt: "12: <footer> Twitter Facebook YouTube </footer>",
+    },
+  ];
+  // Old behavior: FOOTER_HINTS matched → Verified. Now: no assertion → partial.
+  expect(computeAreaStatus("footer", footerEvidence)).toBe("PARTIALLY_VERIFIED");
+  const catalogEvidence = [
+    {
+      tool: "browser_get_text",
+      url: "https://www.saucedemo.com/catalog.html",
+      excerpt: "Sauce Labs Onesie",
+    },
+  ];
+  expect(computeAreaStatus("dynamic catalog", catalogEvidence)).toBe("PARTIALLY_VERIFIED");
+});
+
+test("verified requires a passing assertion tied to the area", () => {
+  const evidence = [
+    { tool: "browser_snapshot", url: "https://www.saucedemo.com/cart.html", excerpt: "Your Cart" },
+    { tool: "test_assert", url: "https://www.saucedemo.com/cart.html", selector: ".cart_item", pass: true },
+  ];
+  expect(computeAreaStatus("cart", evidence)).toBe("VERIFIED");
+  const failing = [
+    { tool: "test_assert", url: "https://www.saucedemo.com/cart.html", selector: ".cart_item", pass: false },
+  ];
+  expect(computeAreaStatus("cart", failing)).toBe("FAILED");
+  expect(computeAreaStatus("cart", [])).toBe("NOT_STARTED");
+  const visitedOnly = [{ tool: "browser_click", url: "https://www.saucedemo.com/cart.html" }];
+  expect(computeAreaStatus("cart", visitedOnly)).toBe("VISITED");
+  const blocked = [
+    { tool: "browser_snapshot", url: "https://www.saucedemo.com/cart.html", excerpt: "[possible error page] 404" },
+  ];
+  expect(computeAreaStatus("cart", blocked)).toBe("BLOCKED");
+});
+
+test("refreshTaskStatuses recomputes the whole board from the ledger", () => {
+  const tasks = buildTasks({
+    site: "https://www.saucedemo.com",
+    areas: ["products", "cart"],
+    priority: "medium",
+    maxActions: Number.POSITIVE_INFINITY,
+    continue: false,
+  });
+  const ledger = [
+    { tool: "browser_snapshot", url: "https://www.saucedemo.com/inventory.html", excerpt: "Products" },
+    { tool: "test_assert", url: "https://www.saucedemo.com/inventory.html", selector: ".inventory_list", pass: true, evidenceId: "ev_3" },
+    { tool: "browser_click", url: "https://www.saucedemo.com/cart.html" },
+  ];
+  const refreshed = refreshTaskStatuses(tasks, ledger);
+  expect(refreshed[0].status).toBe("VERIFIED"); // products: URL match + passing assert
+  expect(refreshed[1].status).toBe("VISITED"); // cart only clicked
+  expect(refreshed[0].evidenceIds).toEqual(["ev_3"]);
+});
+
+test("summarizeCoverage: token-limit stops can never be COMPLETE", () => {
+  const tasks = buildTasks({
+    site: "https://x.test",
+    areas: ["login", "cart"],
+    priority: "medium",
+    maxActions: Number.POSITIVE_INFINITY,
+    continue: false,
+  });
+  tasks[0].status = "VERIFIED";
+  tasks[1].status = "PARTIALLY_VERIFIED";
+  const partial = summarizeCoverage(tasks);
+  expect(partial.overall).toBe("PARTIAL");
+  expect(partial.coveredAreas).toEqual(["login"]);
+  expect(partial.areaStatuses.cart).toBe("PARTIALLY_VERIFIED");
+  // capped with everything verified is still COMPLETE (work truly finished)
+  tasks[1].status = "VERIFIED";
+  expect(summarizeCoverage(tasks, { capped: true, stopReason: "budget_limit" }).overall).toBe("COMPLETE");
+  // capped with unfinished work is PARTIAL even if nothing failed
+  tasks[1].status = "INSPECTED";
+  expect(summarizeCoverage(tasks, { capped: true, stopReason: "budget_limit" }).overall).toBe("PARTIAL");
+});
+
+// ── phase 5: deterministic context compaction ──
+
+test("compaction keeps the original request, drops the middle, summarizes from the ledger", () => {
+  const tasks = buildTasks({
+    site: "https://www.saucedemo.com",
+    areas: ["login", "cart"],
+    priority: "medium",
+    maxActions: Number.POSITIVE_INFINITY,
+    continue: false,
+  });
+  tasks[0].status = "VERIFIED";
+  tasks[0].evidenceIds = ["ev_1"];
+  const messages = [
+    { role: "user", content: "ORIGINAL REQUEST explore saucedemo" },
+    ...Array.from({ length: 20 }, (_, i) => ({ role: "assistant", content: `turn ${i}` })),
+  ] as unknown as Parameters<typeof compactHistory>[0]["messages"];
+  const ledger = [
+    { tool: "browser_snapshot", url: "https://www.saucedemo.com/inventory.html", excerpt: "Products" },
+    { tool: "test_assert", url: "https://www.saucedemo.com/inventory.html", selector: ".title", pass: false, excerpt: "text not found" },
+  ];
+  const result = compactHistory({
+    messages,
+    tasks,
+    ledger,
+    userRequest: "ORIGINAL REQUEST explore saucedemo",
+    currentUrl: "/inventory.html",
+    maxRecentTurns: 4,
+  });
+  expect(result.compacted).toBe(true);
+  expect(result.droppedTurns).toBe(16);
+  // original request survives as the first message
+  expect(result.messages[0].content).toBe("ORIGINAL REQUEST explore saucedemo");
+  // a summary message follows, then the recent tail
+  expect(String(result.messages[1].content)).toContain("Context compacted");
+  expect(result.messages).toHaveLength(1 + 1 + 4);
+  const summaryText = String(result.messages[1].content);
+  expect(summaryText).toContain("ev_1"); // evidence ids carried, not payloads
+  expect(summaryText).toContain("cart"); // pending area preserved
+  expect(summaryText).toContain("assert failed"); // failures survive compaction
+  expect(summaryText).not.toContain("turn 5"); // raw middle turns gone
+});
+
+test("compaction is a no-op for short histories", () => {
+  const messages = [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "ok" },
+  ] as unknown as Parameters<typeof compactHistory>[0]["messages"];
+  const result = compactHistory({
+    messages,
+    tasks: [],
+    ledger: [],
+    userRequest: "hi",
+    currentUrl: "",
+    maxRecentTurns: 12,
+  });
+  expect(result.compacted).toBe(false);
+  expect(result.messages).toBe(messages);
+});
+
+test("shouldCompact trips on the token budget, estimate is chars/4", () => {
+  const small = [{ role: "user", content: "x".repeat(1000) }] as unknown as Parameters<typeof shouldCompact>[0];
+  expect(estimateMessagesTokens(small)).toBe(250);
+  expect(shouldCompact(small, 24_000)).toBe(false);
+  const big = [{ role: "user", content: "x".repeat(100_000) }] as unknown as Parameters<typeof shouldCompact>[0];
+  expect(shouldCompact(big, 24_000)).toBe(true);
+});
+
+// ── phase 7: budget management ──
+
+test("budgets load from env with per-phase shares and reporting reserve", () => {
+  const defaults = loadBudgets({});
+  expect(defaults.maxRunTokens).toBe(1_000_000);
+  expect(defaults.maxContextTokens).toBe(24_000);
+  expect(phaseBudget(defaults, "REPORTING")).toBe(150_000); // 15% reserved
+  expect(phaseBudget(defaults, "EXPLORATION")).toBe(700_000);
+  const custom = loadBudgets({ MAX_RUN_TOKENS: "500000", MAX_CONTEXT_TOKENS: "8000", MAX_MODEL_ROUNDS: "40" });
+  expect(custom.maxRunTokens).toBe(500_000);
+  expect(custom.maxContextTokens).toBe(8_000);
+  expect(custom.maxModelRounds).toBe(40);
+});
+
+test("evaluateBudget stops on total, per-phase, rounds, actions, and duration", () => {
+  const budgets = loadBudgets({ MAX_RUN_TOKENS: "1000000", MAX_AGENT_STEPS: "100" });
+  const base = { budgets, phaseTokens: {}, totalTokens: 0, modelRounds: 0, browserActions: 0, elapsedMs: 0 };
+  expect(evaluateBudget(base).exceeded).toBe(false);
+  expect(evaluateBudget({ ...base, totalTokens: 1_000_000 }).exceeded).toBe(true);
+  // exploration phase alone cannot eat the reporting reserve
+  expect(
+    evaluateBudget({ ...base, phaseTokens: { EXPLORATION: 700_000 } }).exceeded
+  ).toBe(true);
+  expect(evaluateBudget({ ...base, phaseTokens: { EXPLORATION: 699_999 } }).exceeded).toBe(false);
+  expect(evaluateBudget({ ...base, modelRounds: 200 }).exceeded).toBe(true);
+  expect(evaluateBudget({ ...base, browserActions: 100 }).exceeded).toBe(true);
+  expect(evaluateBudget({ ...base, browserActions: 99 }).exceeded).toBe(false);
+  expect(evaluateBudget({ ...base, elapsedMs: 270_000 }).exceeded).toBe(true);
+});
+
+// ── phase 9: report uses backend-authoritative statuses ──
+
+test("report renders backend statuses and never shows complete for partial runs", () => {
+  const coverage = {
+    requestedAreas: ["login", "footer"],
+    visitedAreas: ["login", "footer"],
+    coveredAreas: ["login"],
+    areaStatuses: { login: "VERIFIED", footer: "PARTIALLY_VERIFIED" },
+    overall: "PARTIAL" as const,
+  };
+  expect(resolveStatus("login", coverage)).toBe("Verified");
+  expect(resolveStatus("footer", coverage)).toBe("Partially verified");
+  const md = renderReportMarkdown(
+    { summary: "Explored the demo site.", areas: [], locators: [], gaps: [] },
+    coverage,
+    []
+  );
+  expect(md).toContain("**Overall status: PARTIAL**");
+  expect(md).toContain("## Partial exploration");
+  expect(md).toContain("| footer | Partially verified |");
+  expect(md).not.toContain("(complete)");
+});
+
+// ── phase 4: observation dedup + tool-result compaction ──
 test("dedup suppresses byte-identical observations but never changed page state", () => {
   const runId = "dedup-run";
   clearObservations(runId);
