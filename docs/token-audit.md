@@ -138,3 +138,22 @@ Commits: `09c1e8a` (phase 2) → `2f7ea00` (3) → `1f3cf05` (4) → `d5a528e` (
 6. **`evidence_read` returns full payloads including base64 screenshots** when explicitly requested — intentional (explicit retrieval), but it re-enters context at full size.
 7. **SKIPPED status is defined but never set** — no scope-exclusion syntax exists in `parseExplorationScope` yet.
 8. **Checkpoint resume is scope-level** (completed areas), not task-ID-level; a resumed run rebuilds the task board and re-derives statuses from the new run's ledger rather than importing the old one.
+
+---
+
+# Phase Ten — Performance & reliability evaluation
+
+Per-item verdict on the task doc §13 checklist, evaluated against what phases 2–9 actually built:
+
+| Candidate | Verdict | Where / why |
+|---|---|---|
+| Structured observation caching | **Implemented** | `observation-dedup.ts` — per-run, content-addressed (sha256). No disk cache needed: dedup only suppresses re-sending; the evidence store already persists every payload. |
+| Evidence indexing | **Implemented** | `ev_N` IDs per run; `readEvidence()` filters by kind/tool/url; `getEvidence(id)` for point lookup. JSONL append-only, one file per run — sufficient at hundreds of entries per run. |
+| Incremental state persistence | **Implemented** | Checkpoint written per tool call and on every stop path (`saveExplorationCheckpoint`); evidence appended per tool result; run-log event per SSE event. Nothing waits for run end. |
+| Hash-based snapshot dedup | **Implemented** | `observation-dedup.ts` — full-content hash keyed by URL; any material page change invalidates. |
+| Bounded in-memory context | **Implemented** | `MAX_CONTEXT_TOKENS` (default 24k) + deterministic compaction; token meter capped at 50 runs; dedup map cleared in `finally`. |
+| Efficient retrieval by evidence ID | **Implemented** | `evidence_read` tool + `getEvidence()`. Linear scan of one run's file is fine at current scale; an index would only be needed at thousands of entries per run — not demonstrated, so not built (YAGNI). |
+| Task-level checkpointing | **Partial** | Checkpoint persists scope-level state (completed areas, current/next area, last action, stop reason). The task board is rebuilt and re-derived from the new run's ledger on resume. Task-ID-level import is limitation #8 — deferred because no resume flow consumes it yet. |
+| Redis / second DB / vector store / new orchestration framework | **Not needed — none added** | The existing agent loop, `fs` patterns, and `node:crypto` cover every requirement. Adding infrastructure here would violate the task doc's own constraint (§13, §15, §16). |
+
+**Conclusion:** the existing stack handles every requirement. Zero new dependencies, zero new services, zero framework replacement.
